@@ -3,7 +3,7 @@
 # Build it with `horizon-launcher native-build <this folder> --instance <instance> --trust-native-code`.
 [mod]
 id = "realistic_tnt"
-version = "0.5.1"
+version = "0.5.2"
 
 # Horizon main 2026-11-12 (36eb98b), NATIVE_HOOKS_API 415: the launcher 0.2.62 builds no Nightly up to 2026-11-08.
 [compatibility]

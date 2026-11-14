@@ -116,7 +116,7 @@ def main():
     ctl("look-at", fx - 40, wy - 45, fz)
     ctl("screenshot", os.path.join(shots, "before.png").replace("\\", "/"))
     # It goes off when the bar says so; photographs from then until the front is past the forest.
-    while "explodiu" not in (ctl("messages").get("actionbar") or ""):
+    while "went off" not in (ctl("messages").get("actionbar") or ""):
         time.sleep(0.1)
     boom = ctl("status")["ticks"]
     taken = []

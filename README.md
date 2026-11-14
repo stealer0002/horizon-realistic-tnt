@@ -87,9 +87,9 @@ fly out of the shockwave's reach at 10 blocks a second (`ESCAPE_SPEED`). TNT on 
 fuse.
 
 **A countdown** over the hotbar shows the mass, the seconds left and the shockwave's reach:
-`25087 TNT: explosão em 51 s, alcance 527 blocos` (the messages are in Portuguese). It reads the lit
-TNT's own fuse every tick, so it ends exactly as the TNT goes off. Then it tells you when the shockwave
-will reach you, or that you are out of its reach.
+`25,087 TNT: explodes in 51 s, reach 527 blocks`. It reads the lit TNT's own fuse every tick, so it
+ends exactly as the TNT goes off. Then it tells you when the shockwave will reach you
+(`25,087 TNT went off! The shockwave reaches you in 2 s`), or that you are out of its reach.
 
 **It goes off on time however far you fly.** While a mass burns, the mod holds the chunks round it
 loaded and ticking (the TNT's, the mass's, and out to the land its shockwave tears up, at most 16

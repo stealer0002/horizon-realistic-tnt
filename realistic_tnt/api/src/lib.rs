@@ -1719,15 +1719,35 @@ fn countdown(host: &mut dyn Host, at: [f64; 3], dimension: &str) {
 fn went_off_text(mass: usize, dist: f64) -> String {
     let size = visual_size(mass as f32);
     let reach = f64::from(shock_range(size));
+    let mass = grouped(mass as i64);
     if dist > reach {
-        return format!("{mass} TNT explodiu! Você está fora do alcance ({} blocos)", reach.round() as i64);
+        return format!(
+            "{mass} TNT went off! You are out of its reach ({} blocks)",
+            grouped(reach.round() as i64)
+        );
     }
     let secs = (dist / f64::from(shock_speed(size))).ceil() as i64;
     if secs <= 0 {
-        format!("{mass} TNT explodiu!")
+        format!("{mass} TNT went off!")
     } else {
-        format!("{mass} TNT explodiu! A onda de choque chega em {secs} s")
+        format!("{mass} TNT went off! The shockwave reaches you in {secs} s")
     }
+}
+
+/// `n` with its thousands set apart by commas, as English writes them: "25,087".
+fn grouped(n: i64) -> String {
+    let digits = n.unsigned_abs().to_string();
+    let mut text = String::with_capacity(digits.len() + digits.len() / 3 + 1);
+    if n < 0 {
+        text.push('-');
+    }
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            text.push(',');
+        }
+        text.push(digit);
+    }
+    text
 }
 
 /// Whole seconds (rounded up) for `left` server ticks at `tps` ticks a second (`kept_rate`): 20 a
@@ -1751,10 +1771,14 @@ fn kept_rate(rate: f32, mspt: f64) -> f32 {
     }
 }
 
-/// "512 TNT: explosão em 14 s, alcance 144 blocos".
+/// "512 TNT: explodes in 14 s, reach 144 blocks".
 fn countdown_text(mass: usize, secs: i32) -> String {
     let reach = shock_range(visual_size(mass as f32)).round() as i64;
-    format!("{mass} TNT: explosão em {secs} s, alcance {reach} blocos")
+    format!(
+        "{} TNT: explodes in {secs} s, reach {} blocks",
+        grouped(mass as i64),
+        grouped(reach)
+    )
 }
 
 /// Where a ring may end that starts at `from` and runs toward `to`, so that it holds no more than
@@ -2841,7 +2865,15 @@ mod tests {
             last = ticks;
         }
         assert_eq!(fuse_ticks(1.0e15), i32::from(i16::MAX));
-        assert_eq!(countdown_text(512, 14), "512 TNT: explosão em 14 s, alcance 144 blocos");
+        assert_eq!(countdown_text(512, 14), "512 TNT: explodes in 14 s, reach 144 blocks");
+        assert_eq!(countdown_text(25_087, 51), "25,087 TNT: explodes in 51 s, reach 527 blocks");
+        assert_eq!(
+            countdown_text(1_000_000, 180),
+            "1,000,000 TNT: explodes in 180 s, reach 1,800 blocks"
+        );
+        for (n, text) in [(0, "0"), (999, "999"), (1000, "1,000"), (25_087, "25,087"), (-4096, "-4,096")] {
+            assert_eq!(grouped(n), text);
+        }
     }
 
     #[test]
@@ -2945,11 +2977,14 @@ mod tests {
         assert_eq!(kept_rate(20.0, f64::NAN), 20.0);
         // As it goes off: when the shockwave gets here. 9,261 TNT reach 378 blocks at about
         // 191 blocks a second.
-        assert_eq!(went_off_text(9261, 300.0), "9261 TNT explodiu! A onda de choque chega em 2 s");
-        assert_eq!(went_off_text(9261, 0.0), "9261 TNT explodiu!");
+        assert_eq!(
+            went_off_text(9261, 300.0),
+            "9,261 TNT went off! The shockwave reaches you in 2 s"
+        );
+        assert_eq!(went_off_text(9261, 0.0), "9,261 TNT went off!");
         assert_eq!(
             went_off_text(9261, 500.0),
-            "9261 TNT explodiu! Você está fora do alcance (378 blocos)"
+            "9,261 TNT went off! You are out of its reach (378 blocks)"
         );
     }
 
