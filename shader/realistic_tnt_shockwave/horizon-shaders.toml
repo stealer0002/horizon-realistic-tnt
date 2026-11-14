@@ -1,0 +1,42 @@
+schema = 1
+id = "realistic_tnt_shockwave"
+name = "Realistic TNT: explosions"
+version = "0.3.0"
+api = "0.1"
+description = "The fireball, mushroom cloud, dust, flash and shockwave of the Realistic TNT native mod. It only draws what the mod hands it (frame.mods), so on its own it leaves the picture as vanilla."
+authors = ["Realistic TNT"]
+license = "MIT"
+
+# One full-screen pass over the world's picture. The mod writes up to three blasts into
+# frame.mods (see post/shockwave.wgsl for the slot layout).
+[[post]]
+file = "post/shockwave.wgsl"
+name = "Explosions"
+
+[[options]]
+id = "tnt_flash"
+name = "Explosion flash"
+description = "How bright the flash of an explosion is. 0 turns it off (photosensitivity)."
+type = "float"
+default = 1.0
+min = 0.0
+max = 1.5
+step = 0.05
+
+[[options]]
+id = "tnt_distortion"
+name = "Shockwave distortion"
+description = "How hard an explosion's shockwave bends the picture. 0 turns it off."
+type = "float"
+default = 1.0
+min = 0.0
+max = 2.0
+step = 0.05
+
+[[options]]
+id = "tnt_detail"
+name = "Explosion smoke detail"
+description = "How finely the fireball and smoke are drawn. Fine costs more GPU time."
+type = "choice"
+values = ["Fast", "Balanced", "Fine"]
+default = "Balanced"
