@@ -10,9 +10,10 @@ with no limit.
 
 ![25,087 TNT going off](media/explosion.gif)
 
-**▶ [Watch the full clip with sound](media/explosion.mp4)** (15 s, 1080p 60 fps): 25,087 TNT,
-watched from about 300 blocks away. Shown with the `wisdom_horizon_tnt` shader pack from this
-repository.
+**▶ The full clip, with sound** (15 s, 1080p 60 fps): 25,087 TNT, watched from about 300 blocks
+away. Shown with the `wisdom_horizon_tnt` shader pack from this repository.
+
+https://github.com/user-attachments/assets/d2015f20-e6d9-42c7-b8ef-e2eb0959690b
 
 ## The blast in the video: 25,087 TNT
 
