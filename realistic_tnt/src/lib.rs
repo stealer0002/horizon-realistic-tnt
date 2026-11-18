@@ -1,4 +1,4 @@
-//! Realistic TNT, a native trait mod for Horizon (docs/native-mods.md, "Trait mods").
+//! Realistic TNT, a native mod for Horizon (docs/modding, "Your first native mod").
 //!
 //! Every explosion now:
 //!  * throws part of the plain terrain it would have broken as flying debris: the blocks leave the
@@ -22,21 +22,81 @@
 //!
 //! The shader, the shake, the delayed sound and the push on the window's own player read the blasts
 //! from process memory, so they work in single player and for the host of a LAN game, not for
-//! guests or on a dedicated server. In single player particles reach 32 blocks, as vanilla's do.
-use horizon_client::mod_api::{
-    BlockStateId, CameraShakeEvent, Compound, ExplosionDetonateEvent, ExplosionKnockbackEvent, Flow,
-    Hooks, Host, LevelTickPostEvent, LevelUnloadEvent, NativeBlockEdit, NativeBlockRun,
-    NativeFalling, NativeHeightmap, ParticleOptions, ParticleType, ServerStoppingEvent,
-    ShaderParamsEvent, SoundPlayEvent, Tag, Text, TickEvent, TntPrimedV2Event,
+//! guests or on a dedicated server. The countdown over the hotbar is sent by the server, so every
+//! player sees it. Particles reach 32 blocks, as vanilla's do.
+use mod_api::{
+    BlockEdit, BlockRun, BlockState, BlockUpdateFlags, CameraShakeEvent, ClientHost,
+    ClientTickPostEvent, Compound, EntityRef, ExplosionDetonateEvent, ExplosionKnockbackEvent,
+    ExplosionStartEvent, Falling, Flow, Heightmap, Hooks, Host, HostSide, Identifier, LevelRef,
+    LevelTickPostEvent, LevelUnloadEvent, LoopContext, ParticleKey, ParticleOptions, PlayerRef,
+    PlaySoundEvent,
+    RegistrationContext, Registrar, ServerHost, ServerStoppingEvent, ShaderParamsEvent,
+    SoundAttenuation, SoundPlay, SoundSource, StatePredicate, Tag, Text, HostBlockStates,
+    TicketController, TicketOwner, TntPrimedEvent, ValidateTicketsEvent,
 };
-use std::collections::{HashSet, VecDeque};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+use mod_api::text::TextStyle;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-pub fn hooks() -> Box<dyn Hooks> {
-    Box::new(Mod)
+/// The particles this mod sends, each requested once when the mod registers (`register`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Particle {
+    Ash,
+    Block,
+    CampfireSignalSmoke,
+    DustPillar,
+    Flame,
+    Flash,
+    LargeSmoke,
+    Lava,
+    Poof,
+    Smoke,
+    WhiteAsh,
 }
+
+impl Particle {
+    const ALL: [Particle; 11] = [
+        Particle::Ash,
+        Particle::Block,
+        Particle::CampfireSignalSmoke,
+        Particle::DustPillar,
+        Particle::Flame,
+        Particle::Flash,
+        Particle::LargeSmoke,
+        Particle::Lava,
+        Particle::Poof,
+        Particle::Smoke,
+        Particle::WhiteAsh,
+    ];
+
+    fn id(self) -> &'static str {
+        match self {
+            Particle::Ash => "minecraft:ash",
+            Particle::Block => "minecraft:block",
+            Particle::CampfireSignalSmoke => "minecraft:campfire_signal_smoke",
+            Particle::DustPillar => "minecraft:dust_pillar",
+            Particle::Flame => "minecraft:flame",
+            Particle::Flash => "minecraft:flash",
+            Particle::LargeSmoke => "minecraft:large_smoke",
+            Particle::Lava => "minecraft:lava",
+            Particle::Poof => "minecraft:poof",
+            Particle::Smoke => "minecraft:smoke",
+            Particle::WhiteAsh => "minecraft:white_ash",
+        }
+    }
+
+    /// The key the game gave it, once the mod has registered.
+    fn key(self) -> Option<ParticleKey> {
+        let index = Particle::ALL.iter().position(|&p| p == self)?;
+        PARTICLES.get().map(|keys| keys[index])
+    }
+}
+
+static PARTICLES: OnceLock<[ParticleKey; 11]> = OnceLock::new();
+/// What holds the chunks round a burning mass loaded (`follow_fuses`).
+static FUSE_TICKETS: OnceLock<TicketController> = OnceLock::new();
 
 /// The most blocks one blast throws. Horizon refuses falling blocks past 1024 in a level.
 const MAX_DEBRIS: usize = 96;
@@ -98,8 +158,6 @@ const BOOM_PITCH: f32 = 0.5;
 /// A new explosion joins a blast this young (in ticks) when it is close enough: long enough for
 /// a chain of TNT set off by the first to join it.
 const MERGE_TICKS: u32 = 40;
-/// How far a player may be from a particle to be sent it, where the server knows its players.
-const FAR_PARTICLES: f64 = 192.0;
 /// Vanilla's fuse, in ticks: what TNT lit on its own burns.
 const FUSE_TICKS: i32 = 80;
 /// TNT lit in a mass burns longer, the bigger the mass: vanilla's fuse, plus the time it takes to
@@ -226,7 +284,7 @@ struct Fuse {
     sweep: u32,
     /// The chunks it holds loaded and ticking (`hold_area`, and wherever its TNT is thrown), under
     /// `owner`, once `held`.
-    owner: String,
+    owner: TicketOwner,
     chunks: Vec<[i32; 2]>,
     held: bool,
 }
@@ -250,7 +308,7 @@ fn new_fuse(dimension: &str, pos: [i32; 3], cluster: &[[i32; 3]], total: i32) ->
         entity: None,
         gone: None,
         sweep: FIND_TICKS,
-        owner: format!("realistic_tnt:fuse/{id}"),
+        owner: fuse_owner(id),
         chunks: hold_area(pos, cluster, mass),
         held: false,
     }
@@ -304,21 +362,33 @@ fn in_box(lo: [i32; 3], hi: [i32; 3], pos: [i32; 3], margin: i32) -> bool {
 /// where the mod does not touch chunks).
 struct Release {
     dimension: String,
-    owner: String,
+    owner: TicketOwner,
     chunks: Vec<[i32; 2]>,
+}
+
+/// The ticket owner of fuse `id`: a number of its own, so that two fuses never let go of each
+/// other's chunks. It names no real entity.
+fn fuse_owner(id: u64) -> TicketOwner {
+    TicketOwner::Entity((0x7265_616c_6973_7469_635f_746e_7400_0000_u128) | u128::from(id))
 }
 
 static FUSES: Mutex<Vec<Fuse>> = Mutex::new(Vec::new());
 static RELEASES: Mutex<Vec<Release>> = Mutex::new(Vec::new());
-/// The last countdown the window showed, in whole seconds (-1: none), the fuse it counted (0:
-/// none), and the window tick it was last sent on (the bar fades three seconds after).
-static SHOWN_SECS: AtomicI32 = AtomicI32::new(-1);
-static SHOWN_FUSE: AtomicU64 = AtomicU64::new(0);
-static SHOWN_AT: AtomicU32 = AtomicU32::new(0);
-static WINDOW_TICKS: AtomicU32 = AtomicU32::new(0);
-/// The countdown is sent again at least this often, in window ticks, so that it does not fade
-/// while a slow server takes longer than that over one of its seconds.
-const COUNTDOWN_RESEND: u32 = 40;
+
+/// The countdown a player was last shown over their hotbar: in whole seconds, the fuse it
+/// counted, and the level tick it was sent on (the bar fades three seconds after).
+#[derive(Clone, Copy, Debug)]
+struct Counted {
+    secs: i32,
+    fuse: u64,
+    at: i64,
+}
+
+/// The countdown each player was last shown, by player UUID.
+static COUNTED: Mutex<Option<HashMap<u128, Counted>>> = Mutex::new(None);
+/// The countdown is sent again at least this often, in ticks of the level's game time, so that it
+/// does not fade while a slow server takes longer than that over one of its seconds.
+const COUNTDOWN_RESEND: i64 = 40;
 /// The ticks a second the server keeps now (`f32` bits, `kept_rate`), for the countdown's seconds.
 static SERVER_TPS: AtomicU32 = AtomicU32::new(0x41A0_0000); // 20.0
 
@@ -338,17 +408,59 @@ fn window_at() -> std::sync::MutexGuard<'static, Option<(String, [f64; 3])>> {
     WINDOW_AT.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The last explosion the server announced (`explosion_start`): its level, centre and radius, which
+/// `explosion_detonate` reads right after for its yield.
+static LAST_START: Mutex<Option<(String, [f64; 3], f32)>> = Mutex::new(None);
+
+fn last_start() -> std::sync::MutexGuard<'static, Option<(String, [f64; 3], f32)>> {
+    LAST_START.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[derive(Default)]
 struct Mod;
 
+#[mod_api::horizon_mod]
 impl Hooks for Mod {
-    fn explosion_detonate(&self, host: &mut dyn Host, event: &mut ExplosionDetonateEvent<'_>) {
+    fn register(&self, registrar: &mut dyn Registrar, _context: &RegistrationContext) {
+        // The particles it sends, and the controller that holds the chunks of a burning mass.
+        let _ = PARTICLES.set(Particle::ALL.map(|p| registrar.particle_key(p.id())));
+        let _ = FUSE_TICKETS.set(registrar.register_ticket_controller("realistic_tnt:fuse", true));
+    }
+
+    fn validate_tickets(&self, _host: &mut dyn ServerHost, event: &mut ValidateTicketsEvent<'_>) {
+        // A fuse lives in memory only: the chunks a world saved for one (the game closed while a
+        // mass burned) are let go of when it loads again.
+        if FUSE_TICKETS.get() != Some(&event.controller) {
+            return;
+        }
+        for (pos, _) in event.validation.block_tickets() {
+            event.validation.remove_block_tickets(pos);
+        }
+        for (uuid, _) in event.validation.entity_tickets() {
+            event.validation.remove_entity_tickets(uuid);
+        }
+    }
+
+    fn explosion_start(&self, _host: &mut dyn ServerHost, event: &mut ExplosionStartEvent<'_>) -> Flow {
+        let start = event.explosion;
+        *last_start() = Some((start.dimension.to_owned(), start.center, start.radius));
+        Flow::Continue
+    }
+
+    fn explosion_detonate(&self, host: &mut dyn ServerHost, event: &mut ExplosionDetonateEvent<'_>) {
         let center = event.center;
         let dimension = event.dimension.to_owned();
-        let own = yield_of(event.source.map(|(_, kind)| kind));
+        let Some(level) = host.level(&dimension) else {
+            return;
+        };
+        let own = last_start()
+            .take()
+            .filter(|(dim, at, _)| *dim == dimension && *at == center)
+            .map_or(1.0, |(_, _, radius)| yield_of(radius));
         let cell = cell_of(center);
         // TNT blocks touching it go off with it, now, instead of one by one after it.
         let folded = {
-            let look = |pos| host.block(pos);
+            let look = |pos| block_at(&*host, level, pos);
             tnt_cluster(&look, cell, MAX_FOLD)
         };
         if !folded.is_empty() {
@@ -376,14 +488,14 @@ impl Hooks for Mod {
         let size = visual_size(added);
         let seed = unit(mix(cell, 77), 1) as f32;
         let ground = {
-            let look = |pos| host.block(pos);
+            let look = |pos| block_at(&*host, level, pos);
             ground_under(&look, center)
         };
 
         // Part of what it breaks flies instead.
         let mut trails = Vec::new();
-        let mut crumbs: Vec<BlockStateId> = Vec::new();
-        if let Some(air) = host.default_state("minecraft:air") {
+        let mut crumbs: Vec<BlockState> = Vec::new();
+        if let Some(air) = state_of(&*host, "minecraft:air") {
             let mut kept = Vec::with_capacity(event.blocks.len());
             let mut thrown = 0;
             for &pos in event.blocks.iter() {
@@ -392,26 +504,20 @@ impl Hooks for Mod {
                     kept.push(pos);
                     continue;
                 }
-                let name = host.block(pos);
-                let Some(state) = is_debris(&name)
-                    .then(|| host.default_state(&name))
-                    .flatten()
-                else {
+                let name = block_at(&*host, level, pos);
+                let Some(state) = is_debris(&name).then(|| state_of(&*host, &name)).flatten() else {
                     kept.push(pos);
                     continue;
                 };
                 // Take the block out of the world, then throw it from where it stood. If Horizon
                 // refuses the throw, put it back and let the blast break it as usual.
-                if !host.set_block(&dimension, pos, air, 3) {
+                if !set_block(host, level, pos, air) {
                     kept.push(pos);
                     continue;
                 }
                 let from = [pos[0] as f64 + 0.5, pos[1] as f64, pos[2] as f64 + 0.5];
                 let velocity = launch_velocity(center, pos, f64::from(power), roll);
-                let falling = NativeFalling {
-                    drop_item: true,
-                    hurts: false,
-                };
+                let falling = falling(true, false);
                 if host.spawn_falling_block(&dimension, state, from, velocity, falling) {
                     thrown += 1;
                     if trails.len() < MAX_TRAILS {
@@ -425,7 +531,7 @@ impl Hooks for Mod {
                         crumbs.push(state);
                     }
                 } else {
-                    host.set_block(&dimension, pos, state, 3);
+                    set_block(host, level, pos, state);
                     kept.push(pos);
                 }
             }
@@ -433,15 +539,14 @@ impl Hooks for Mod {
         }
 
         // The burst itself: a flash, sparks, flames, smoke and crumbs of what it tore up.
-        let viewers = viewers(&*host, &dimension);
         for puff in burst(center, power, size) {
-            emit(host, &viewers, puff);
+            emit(host, level, puff);
         }
         for state in crumbs {
             let spread = [f64::from(power) * 0.4; 3];
-            let mut puff = Puff::new(ParticleType::Block, center, spread, 0.45, 24);
+            let mut puff = Puff::new(Particle::Block, center, spread, 0.45, 24);
             puff.state = Some(state);
-            emit(host, &viewers, puff);
+            emit(host, level, puff);
         }
 
         // Remember it. A big one scorches the land round its crater as it digs (`carve`).
@@ -477,21 +582,29 @@ impl Hooks for Mod {
         });
     }
 
-    fn tnt_primed_v2(&self, host: &mut dyn Host, event: &mut TntPrimedV2Event<'_>) -> Flow {
+    fn tnt_primed(&self, host: &mut dyn ServerHost, event: &mut TntPrimedEvent) -> Flow {
         // TNT lit in a mass burns longer, the bigger the mass: time to get out of its reach. The
         // lit TNT is found and its fuse stretched on the level's next tick (`follow_fuses`), and
         // the chunks round it are held so that it burns however far away the players go.
         let cell = event.pos;
-        let dimension = event.dimension;
+        // The level of the player who lit it, else the one in place (fire, a signal, an arrow).
+        let dimension = event
+            .player
+            .and_then(|uuid| host.player(uuid))
+            .and_then(|player| player.level(&*host))
+            .map_or_else(|| host.dimension().to_owned(), |level| level_name(&*host, level));
+        let Some(level) = host.level(&dimension) else {
+            return Flow::Continue;
+        };
         // TNT lit in a mass that is already burning (a signal reaching several blocks of it, fire
         // spreading over it, a second one lit) goes off with it, when it does: the mass's fuse
         // gives it its own fuse on the next ticks (`follow_fuses`), without walking the mass again.
-        if let Some(burning) = burning_mass_of(&mut fuses(), dimension, cell) {
+        if let Some(burning) = burning_mass_of(&mut fuses(), &dimension, cell) {
             burning.sweep = FIND_TICKS;
             return Flow::Continue;
         }
         let cluster = {
-            let look = |pos| host.block(pos);
+            let look = |pos| block_at(&*host, level, pos);
             tnt_cluster(&look, cell, MAX_FOLD)
         };
         let mass = mass_of(&cluster, cell);
@@ -522,12 +635,12 @@ impl Hooks for Mod {
             }
             return Flow::Continue;
         }
-        let fuse = new_fuse(dimension, cell, &cluster, total);
+        let fuse = new_fuse(&dimension, cell, &cluster, total);
         add_fuse(&mut all, fuse);
         Flow::Continue
     }
 
-    fn explosion_knockback(&self, _host: &mut dyn Host, event: &mut ExplosionKnockbackEvent<'_>) {
+    fn explosion_knockback(&self, _host: &mut dyn ServerHost, event: &mut ExplosionKnockbackEvent<'_>) {
         // The lit TNT of a mass still burning is not thrown out of it: it goes off with its mass.
         if event.entity.is_some_and(|id| followed_tnt().contains(&id)) {
             *event.knockback_velocity = [0.0; 3];
@@ -545,31 +658,38 @@ impl Hooks for Mod {
         }
     }
 
-    fn level_unload(&self, _host: &mut dyn Host, event: &mut LevelUnloadEvent<'_>) {
+    fn level_unload(&self, _host: &mut dyn ServerHost, event: &mut LevelUnloadEvent<'_>) {
         // Its chunks go with it, and the fuses burning in it are no longer followed.
         fuses().retain(|f| f.dimension != event.dimension);
         releases().retain(|r| r.dimension != event.dimension);
     }
 
-    fn server_stopping(&self, _host: &mut dyn Host, _event: &mut ServerStoppingEvent) {
+    fn server_stopping(&self, _host: &mut dyn ServerHost, _event: &mut ServerStoppingEvent) {
         // The server lets go of every chunk held as it stops; the next world starts afresh.
         fuses().clear();
         releases().clear();
+        *counted() = None;
     }
 
-    fn level_tick_post(&self, host: &mut dyn Host, event: &mut LevelTickPostEvent<'_>) {
+    fn level_tick_post(&self, host: HostSide, event: &mut LevelTickPostEvent) {
+        let HostSide::Server(host) = host else {
+            return;
+        };
+        let level = event.level;
+        let dimension = level_name(&*host, level);
         let (rate, mspt) = host.tick_stats();
         let tps = kept_rate(rate, mspt);
         if tps.is_finite() && tps > 0.0 {
             SERVER_TPS.store(tps.to_bits(), Ordering::Relaxed);
         }
-        follow_fuses(host, event.dimension);
+        follow_fuses(host, level, &dimension);
+        countdown(host, level, &dimension);
         // Take this tick's work out while holding the lock; do it after, with the lock released
         // (the window's frame reads the same list).
         let mut work = Vec::new();
         {
             let mut all = blasts();
-            for blast in all.iter_mut().filter(|b| b.dimension == event.dimension) {
+            for blast in all.iter_mut().filter(|b| b.dimension == dimension) {
                 blast.ticks += 1;
                 let take = if blast.ticks >= 3 {
                     blast.scorch.len().min(SCORCH_PER_TICK)
@@ -622,37 +742,37 @@ impl Hooks for Mod {
                     shock,
                 });
             }
-            all.retain(|b| b.dimension != event.dimension || b.ticks <= life_ticks(b.size));
+            all.retain(|b| b.dimension != dimension || b.ticks <= life_ticks(b.size));
         }
         if work.is_empty() {
             return;
         }
-        let viewers = viewers(&*host, event.dimension);
+        let viewers = viewers(&*host, level);
         for job in work.iter_mut() {
             for puff in plume(job.ticks, job.base, job.power, job.size) {
-                emit(host, &viewers, puff);
+                emit(host, level, puff);
             }
             if job.grounded {
-                dust_ring(host, &viewers, job);
+                dust_ring(host, level, job);
             }
-            job.trails = smoke_trails(host, &viewers, std::mem::take(&mut job.trails));
-            scorch(host, event.dimension, job);
+            job.trails = smoke_trails(host, level, std::mem::take(&mut job.trails));
+            scorch(host, level, job);
             if let Some((from, to)) = job.carve {
-                ejecta(host, &viewers, event.dimension, job, from, to);
-                carve(host, event.dimension, job, from, to);
+                ejecta(host, level, &dimension, job, from, to);
+                carve(host, &dimension, job, from, to);
             }
             if let Some((from, to)) = job.scorch_ring {
-                scorch_ring(host, event.dimension, job, from, to);
+                scorch_ring(host, &dimension, job, from, to);
             }
             if let Some((from, to)) = job.lift {
-                lift(host, &viewers, event.dimension, job, from, to);
+                lift(host, level, &viewers, &dimension, job, from, to);
             }
         }
         // The shockwave reaches what is in its way: it hurts and throws it.
         let mut struck: Vec<(u64, Vec<u32>)> = Vec::new();
         for job in &work {
             if let Some((front, hit)) = &job.shock {
-                struck.push((job.id, shockwave(host, event.dimension, job, *front, hit)));
+                struck.push((job.id, shockwave(host, level, job, *front, hit)));
             }
         }
         // Hand the trails and what was struck back (a blast may have changed meanwhile).
@@ -671,23 +791,24 @@ impl Hooks for Mod {
         }
     }
 
-    fn tick(&self, host: &mut dyn Host, _event: &mut TickEvent) {
+    fn client_tick_post(&self, host: &mut dyn ClientHost, _event: &mut ClientTickPostEvent) {
         // The window's game queues each blast's sound once, to be heard as its shockwave arrives.
-        if !host.window() {
-            return;
-        }
-        let Some(player) = host.player() else {
+        let Some(player) = host.local_player() else {
             return;
         };
-        let at = [player.x, player.y, player.z];
-        *window_at() = Some((player.dimension.to_owned(), at));
-        countdown(host, at, player.dimension);
+        let Some(at) = player.entity().position(&*host) else {
+            return;
+        };
+        let Some(dimension) = player.level(&*host).map(|level| level_name(&*host, level)) else {
+            return;
+        };
+        *window_at() = Some((dimension.clone(), at));
         let now = Instant::now();
         let mut heard = Vec::new();
         let mut kicks = Vec::new();
         {
             let mut all = blasts();
-            for blast in all.iter_mut().filter(|b| b.dimension == player.dimension) {
+            for blast in all.iter_mut().filter(|b| b.dimension == dimension) {
                 if !blast.heard {
                     blast.heard = true;
                     heard.push((blast.center, blast.size));
@@ -708,14 +829,18 @@ impl Hooks for Mod {
             host.push_player(kick.map(|v| v as f32));
         }
         for (center, size) in heard {
-            let dist = distance([player.x, player.y, player.z], center) as f32;
+            let dist = distance(at, center) as f32;
             for cue in boom(dist, size) {
-                host.play_local_sound(cue.sound, center, cue.volume, cue.pitch, cue.delay);
+                let mut sound = SoundPlay::at(cue.sound, SoundSource::Blocks, center);
+                sound.volume = cue.volume;
+                sound.pitch = cue.pitch;
+                sound.attenuation = SoundAttenuation::Linear;
+                host.play_local_sound(&sound, cue.delay.max(0) as u32);
             }
         }
     }
 
-    fn camera_shake(&self, host: &dyn Host, event: &mut CameraShakeEvent<'_>) {
+    fn camera_shake(&self, host: &dyn ClientHost, event: &mut CameraShakeEvent<'_>) {
         let Some(camera) = host.camera() else {
             return;
         };
@@ -736,27 +861,29 @@ impl Hooks for Mod {
         }
     }
 
-    fn sound_play(&self, event: &mut SoundPlayEvent<'_>) -> Flow {
+    fn play_sound(&self, _context: &dyn LoopContext, event: &mut PlaySoundEvent<'_>) {
         // Vanilla plays its explosion sound the moment the blast goes off; this mod plays its own
         // boom when the shockwave arrives. Both together sound like the same blast twice, so the
         // vanilla one is dropped where the mod has a blast of its own.
-        let sound = event.sound;
-        if !sound.starting || sound.identifier != "minecraft:entity.generic.explode" {
-            return Flow::Continue;
+        let sound = event.original;
+        if !event.starting || sound.identifier != "minecraft:entity.generic.explode" {
+            return;
         }
         let now = Instant::now();
         let ours = blasts().iter().any(|b| {
             vanilla_boom_of(
-                event.pitch,
+                sound.pitch,
                 distance(sound.position, b.center),
                 b.size,
                 now.duration_since(b.born).as_secs_f32(),
             )
         });
-        if ours { Flow::Cancel } else { Flow::Continue }
+        if ours {
+            *event.sound = None;
+        }
     }
 
-    fn shader_params(&self, host: &dyn Host, event: &mut ShaderParamsEvent<'_>) {
+    fn shader_params(&self, host: &dyn ClientHost, event: &mut ShaderParamsEvent<'_>) {
         let dimension = host.dimension();
         let now = Instant::now();
         let shown: Vec<Shown> = blasts()
@@ -775,6 +902,45 @@ impl Hooks for Mod {
             event.params[slot] = value;
         }
     }
+}
+
+/// The block at `pos` of `level`, by name (`minecraft:tnt`); empty where it can't be read.
+fn block_at(host: &dyn Host, level: LevelRef, pos: [i32; 3]) -> String {
+    level.block(host, pos).map(|key| key.id(host)).unwrap_or_default()
+}
+
+/// The name of `level` (`minecraft:overworld`).
+fn level_name(host: &dyn Host, level: LevelRef) -> String {
+    level.dimension().id(host).unwrap_or_default()
+}
+
+/// What a falling block the mod throws does when it lands and when it hits.
+fn falling(drop_item: bool, hurts: bool) -> Falling {
+    let mut falling = Falling::default();
+    falling.drop_item = drop_item;
+    falling.hurts = hurts;
+    falling
+}
+
+/// The default state of the block named `name` (`minecraft:air`).
+fn state_of(host: &dyn Host, name: &str) -> Option<BlockState> {
+    host.block_state_default(host.block_key(name)?)
+}
+
+/// The block's name (`minecraft:grass_block`), without its properties.
+fn name_of(host: &dyn Host, state: BlockState) -> String {
+    state.block().id(host)
+}
+
+/// Sets the block at `pos` as `/setblock` does (neighbours told, players sent the change):
+/// whether it changed.
+fn set_block(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3], state: BlockState) -> bool {
+    let flags = BlockUpdateFlags::NEIGHBORS | BlockUpdateFlags::CLIENTS;
+    matches!(level.set_block(host, pos, state, flags), Ok(true))
+}
+
+fn counted() -> std::sync::MutexGuard<'static, Option<HashMap<u128, Counted>>> {
+    COUNTED.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// One blast's work for one tick, taken out of the shared list.
@@ -802,30 +968,27 @@ struct Work {
     shock: Option<(f64, HashSet<u32>)>,
 }
 
-/// A player particles are sent to.
+/// A player of the level, where they are: the land torn up flies where players can see it.
 struct Viewer {
-    uuid: u128,
     position: [f64; 3],
 }
 
-/// The players of `dimension` the server knows. Empty in a world nobody else can join (plain
-/// single player), where particles go out as vanilla's do instead.
-fn viewers(host: &dyn Host, dimension: &str) -> Vec<Viewer> {
-    host.server_players()
+/// The players of `level` the server knows.
+fn viewers(host: &dyn Host, level: LevelRef) -> Vec<Viewer> {
+    level
+        .online_players(host)
+        .unwrap_or_default()
         .into_iter()
-        .filter(|p| p.dimension == dimension)
-        .map(|p| Viewer {
-            uuid: p.uuid,
-            position: p.position,
-        })
+        .filter_map(|player| player.entity().position(host))
+        .map(|position| Viewer { position })
         .collect()
 }
 
 /// One call to `send_particles`.
 struct Puff {
-    kind: ParticleType,
+    kind: Particle,
     /// The block of a block particle.
-    state: Option<BlockStateId>,
+    state: Option<BlockState>,
     at: [f64; 3],
     spread: [f64; 3],
     speed: f64,
@@ -833,7 +996,7 @@ struct Puff {
 }
 
 impl Puff {
-    fn new(kind: ParticleType, at: [f64; 3], spread: [f64; 3], speed: f64, count: i32) -> Self {
+    fn new(kind: Particle, at: [f64; 3], spread: [f64; 3], speed: f64, count: i32) -> Self {
         Self {
             kind,
             state: None,
@@ -845,40 +1008,26 @@ impl Puff {
     }
 }
 
-/// Sends a puff: to each player near enough, however far the particle limit lets them see, where
-/// the server knows its players; else as vanilla sends particles (to those within 32 blocks).
-fn emit(host: &mut dyn Host, viewers: &[Viewer], puff: Puff) {
-    let options = ParticleOptions::simple(puff.kind);
-    if viewers.is_empty() {
-        host.send_particles(
-            &options,
-            puff.state,
-            puff.at,
-            puff.spread,
-            puff.speed,
-            puff.count,
-        );
+/// Sends a puff as vanilla sends particles: to the players of the level within 32 blocks.
+fn emit(host: &mut dyn ServerHost, level: LevelRef, puff: Puff) {
+    let Some(key) = puff.kind.key() else {
         return;
-    }
-    for viewer in viewers {
-        if distance(viewer.position, puff.at) <= FAR_PARTICLES {
-            host.send_particles_to(
-                viewer.uuid,
-                &options,
-                puff.state,
-                puff.at,
-                puff.spread,
-                puff.speed,
-                puff.count,
-                true,
-            );
-        }
-    }
+    };
+    let options = ParticleOptions::simple(key);
+    level.send_particles(
+        host,
+        &options,
+        puff.state,
+        puff.at,
+        puff.spread,
+        puff.speed,
+        puff.count,
+    );
 }
 
 /// The ring of dust the shockwave kicks up along the ground: pillars of the ground's own dust at
 /// points round a circle that races out and slows, as the pack's dust skirt does.
-fn dust_ring(host: &mut dyn Host, viewers: &[Viewer], job: &Work) {
+fn dust_ring(host: &mut dyn ServerHost, level: LevelRef, job: &Work) {
     let secs = f64::from(job.ticks) / 20.0;
     if secs > 1.3 * f64::from(time_scale(job.size)) {
         return;
@@ -892,7 +1041,7 @@ fn dust_ring(host: &mut dyn Host, viewers: &[Viewer], job: &Work) {
         let x = job.base[0] + radius * angle.cos();
         let z = job.base[2] + radius * angle.sin();
         let found = {
-            let look = |pos| host.block(pos);
+            let look = |pos| block_at(&*host, level, pos);
             surface(&look, x.floor() as i32, z.floor() as i32, ground + 3, ground - 4)
         };
         let Some((y, name)) = found else {
@@ -901,18 +1050,18 @@ fn dust_ring(host: &mut dyn Host, viewers: &[Viewer], job: &Work) {
         if name.contains("water") || name.contains("lava") {
             continue;
         }
-        let Some(state) = host.default_state(&name) else {
+        let Some(state) = state_of(&*host, &name) else {
             continue;
         };
         let at = [x, f64::from(y) + 1.05, z];
-        let mut pillar = Puff::new(ParticleType::DustPillar, at, [0.35, 0.1, 0.35], 0.12, 5);
+        let mut pillar = Puff::new(Particle::DustPillar, at, [0.35, 0.1, 0.35], 0.12, 5);
         pillar.state = Some(state);
-        emit(host, viewers, pillar);
+        emit(host, level, pillar);
         if i % 2 == 0 {
             emit(
                 host,
-                viewers,
-                Puff::new(ParticleType::Poof, at, [0.3, 0.15, 0.3], 0.04, 1),
+                level,
+                Puff::new(Particle::Poof, at, [0.3, 0.15, 0.3], 0.04, 1),
             );
         }
     }
@@ -920,26 +1069,26 @@ fn dust_ring(host: &mut dyn Host, viewers: &[Viewer], job: &Work) {
 
 /// Moves each flying block's trail on a tick and leaves smoke (and at first flame) where it is;
 /// the trails that go on. One ends when its time is up or it has flown into something.
-fn smoke_trails(host: &mut dyn Host, viewers: &[Viewer], trails: Vec<Trail>) -> Vec<Trail> {
+fn smoke_trails(host: &mut dyn ServerHost, level: LevelRef, trails: Vec<Trail>) -> Vec<Trail> {
     let mut flying = Vec::with_capacity(trails.len());
     for mut trail in trails {
         trail.advance();
         if trail.age > TRAIL_TICKS {
             continue;
         }
-        if trail.age > 2 && !is_air(&host.block(cell_of(trail.pos))) {
+        if trail.age > 2 && !is_air(&block_at(&*host, level, cell_of(trail.pos))) {
             continue;
         }
         emit(
             host,
-            viewers,
-            Puff::new(ParticleType::Smoke, trail.pos, [0.08; 3], 0.01, 2),
+            level,
+            Puff::new(Particle::Smoke, trail.pos, [0.08; 3], 0.01, 2),
         );
         if trail.age <= 14 && trail.age % 2 == 0 {
             emit(
                 host,
-                viewers,
-                Puff::new(ParticleType::Flame, trail.pos, [0.05; 3], 0.0, 1),
+                level,
+                Puff::new(Particle::Flame, trail.pos, [0.05; 3], 0.0, 1),
             );
         }
         flying.push(trail);
@@ -949,11 +1098,11 @@ fn smoke_trails(host: &mut dyn Host, viewers: &[Viewer], trails: Vec<Trail>) -> 
 
 /// Scorches this tick's columns of ground: plants burn away and the soil chars, more surely the
 /// nearer the blast.
-fn scorch(host: &mut dyn Host, dimension: &str, job: &Work) {
+fn scorch(host: &mut dyn ServerHost, level: LevelRef, job: &Work) {
     if job.columns.is_empty() {
         return;
     }
-    let Some(air) = host.default_state("minecraft:air") else {
+    let Some(air) = state_of(&*host, "minecraft:air") else {
         return;
     };
     let radius = scorch_radius(job.power);
@@ -967,16 +1116,16 @@ fn scorch(host: &mut dyn Host, dimension: &str, job: &Work) {
             continue;
         }
         let found = {
-            let look = |pos| host.block(pos);
+            let look = |pos| block_at(&*host, level, pos);
             scorch_target(&look, x, z, ground + 4, ground - depth)
         };
         for plant in found.plants {
-            host.set_block(dimension, plant, air, 3);
+            set_block(host, level, plant, air);
         }
         if let Some((pos, charred)) = found.soil
-            && let Some(state) = host.default_state(charred)
+            && let Some(state) = state_of(&*host, charred)
         {
-            host.set_block(dimension, pos, state, 3);
+            set_block(host, level, pos, state);
         }
     }
 }
@@ -1095,22 +1244,22 @@ fn burst(center: [f64; 3], power: f32, size: f32) -> Vec<Puff> {
     vec![
         // Sparks: lava drops leap up and fall back glowing.
         Puff::new(
-            ParticleType::Lava,
+            Particle::Lava,
             center,
             [p * 0.25, 0.3, p * 0.25],
             0.0,
             8 + (size * 2.0) as i32,
         ),
-        Puff::new(ParticleType::Flame, center, [p * 0.3; 3], 0.18, 30),
+        Puff::new(Particle::Flame, center, [p * 0.3; 3], 0.18, 30),
         Puff::new(
-            ParticleType::LargeSmoke,
+            Particle::LargeSmoke,
             above,
             [p * 0.45, p * 0.3, p * 0.45],
             0.1,
             40,
         ),
         Puff::new(
-            ParticleType::Poof,
+            Particle::Poof,
             above,
             [p * 0.4, p * 0.25, p * 0.4],
             0.22,
@@ -1134,7 +1283,7 @@ fn plume(ticks: u32, base: [f64; 3], power: f32, size: f32) -> Vec<Puff> {
     let mut out = Vec::new();
     if t <= 70 {
         out.push(Puff::new(
-            ParticleType::CampfireSignalSmoke,
+            Particle::CampfireSignalSmoke,
             [x, y + cap * 0.5, z],
             [s * 0.12, cap * 0.5, s * 0.12],
             0.01,
@@ -1143,7 +1292,7 @@ fn plume(ticks: u32, base: [f64; 3], power: f32, size: f32) -> Vec<Puff> {
     }
     if t <= 60 && t.is_multiple_of(2) {
         out.push(Puff::new(
-            ParticleType::LargeSmoke,
+            Particle::LargeSmoke,
             [x, y + 0.5, z],
             [p * 0.5, 0.5, p * 0.5],
             0.03,
@@ -1154,7 +1303,7 @@ fn plume(ticks: u32, base: [f64; 3], power: f32, size: f32) -> Vec<Puff> {
         let count = (5.0 * (1.0 - f64::from(t) / 200.0)).ceil() as i32;
         if count > 0 {
             out.push(Puff::new(
-                ParticleType::LargeSmoke,
+                Particle::LargeSmoke,
                 [x, y + cap, z],
                 [wide * 0.45, wide * 0.3, wide * 0.45],
                 0.02,
@@ -1164,7 +1313,7 @@ fn plume(ticks: u32, base: [f64; 3], power: f32, size: f32) -> Vec<Puff> {
     }
     if (16..200).contains(&t) && t.is_multiple_of(5) {
         out.push(Puff::new(
-            ParticleType::WhiteAsh,
+            Particle::WhiteAsh,
             [x, y + s * 1.5, z],
             [s * 1.6, s * 0.8, s * 1.6],
             0.0,
@@ -1173,7 +1322,7 @@ fn plume(ticks: u32, base: [f64; 3], power: f32, size: f32) -> Vec<Puff> {
     }
     if (20..200).contains(&t) && t.is_multiple_of(7) {
         out.push(Puff::new(
-            ParticleType::Ash,
+            Particle::Ash,
             [x, y + s * 1.2, z],
             [s * 1.4, s * 0.8, s * 1.4],
             0.0,
@@ -1182,7 +1331,7 @@ fn plume(ticks: u32, base: [f64; 3], power: f32, size: f32) -> Vec<Puff> {
     }
     if t <= 100 && t % 10 == 5 {
         out.push(Puff::new(
-            ParticleType::Lava,
+            Particle::Lava,
             [x, y + 0.3, z],
             [p * 0.35, 0.1, p * 0.35],
             0.0,
@@ -1220,20 +1369,10 @@ fn visual_size(yield_tnt: f32) -> f32 {
     BASE_SIZE * yield_tnt.max(0.05).cbrt()
 }
 
-/// The yield in TNT of an explosion of entity kind `kind` (none for a bed or an anchor): the cube
-/// of its power over TNT's 4, as its volume goes.
-fn yield_of(kind: Option<&str>) -> f32 {
-    let power: f32 = match kind {
-        Some("minecraft:tnt" | "minecraft:tnt_minecart") => 4.0,
-        Some("minecraft:creeper") => 3.0,
-        Some("minecraft:end_crystal") => 6.0,
-        Some("minecraft:wither") => 7.0,
-        Some("minecraft:fireball" | "minecraft:wither_skull" | "minecraft:dragon_fireball") => 1.5,
-        Some(_) => 4.0,
-        // Beds and respawn anchors blow up with power 5.
-        None => 5.0,
-    };
-    (power / 4.0).powi(3)
+/// The yield in TNT of an explosion of radius (power) `radius`: the cube of its power over TNT's 4,
+/// as its volume goes (a creeper 3, a bed 5, an end crystal 6).
+fn yield_of(radius: f32) -> f32 {
+    (radius / 4.0).powi(3)
 }
 
 /// How much slower a blast of `size` lives than one TNT's, and how much faster its front runs:
@@ -1311,12 +1450,15 @@ fn tnt_cluster(look: &dyn Fn([i32; 3]) -> String, cell: [i32; 3], cap: usize) ->
 
 /// Takes `blocks` out of the world at once, telling no neighbour (TNT taken into a blast must not
 /// set anything else off).
-fn remove_blocks(host: &mut dyn Host, dimension: &str, blocks: &[[i32; 3]]) {
-    let edit = NativeBlockEdit {
-        palette: vec!["minecraft:air".to_owned()],
+fn remove_blocks(host: &mut dyn ServerHost, dimension: &str, blocks: &[[i32; 3]]) {
+    let Some(air) = state_of(&*host, "minecraft:air") else {
+        return;
+    };
+    let edit = BlockEdit {
+        palette: vec![air],
         runs: blocks
             .iter()
-            .map(|&[x, y, z]| NativeBlockRun {
+            .map(|&[x, y, z]| BlockRun {
                 x,
                 z,
                 y,
@@ -1414,9 +1556,9 @@ fn forget(fuse: Fuse) {
     }
 }
 
-/// The fuse of primed TNT `id` in `dimension`, as its data holds it; none once it is gone.
-fn live_fuse(host: &mut dyn Host, dimension: &str, id: u32) -> Option<i32> {
-    let nbt = host.entity_nbt_in(dimension, id)?;
+/// The fuse of primed TNT `id`, as its data holds it; none once it is gone.
+fn live_fuse(host: &mut dyn ServerHost, id: u32) -> Option<i32> {
+    let nbt = host.entity(id)?.nbt(host)?;
     let (_, tag) = nbt
         .iter()
         .find(|(key, _)| key.0.iter().copied().eq("fuse".encode_utf16()))?;
@@ -1441,7 +1583,7 @@ fn fuse_ticks(yield_tnt: f32) -> i32 {
 /// block became and gives it its whole fuse (`/data merge entity ... {fuse: ...}`), gives the same
 /// fuse to TNT lit in the mass since, reads the fuse back each tick for the countdown, and lets go
 /// of the chunks once it has gone off and its crater is dug.
-fn follow_fuses(host: &mut dyn Host, dimension: &str) {
+fn follow_fuses(host: &mut dyn ServerHost, level: LevelRef, dimension: &str) {
     let mut release: Vec<Release> = {
         let mut queue = releases();
         let (here, rest): (Vec<Release>, Vec<Release>) =
@@ -1478,7 +1620,7 @@ fn follow_fuses(host: &mut dyn Host, dimension: &str) {
                 if f.held && !f.chunks.is_empty() {
                     release.push(Release {
                         dimension: dimension.to_owned(),
-                        owner: std::mem::take(&mut f.owner),
+                        owner: f.owner,
                         chunks: std::mem::take(&mut f.chunks),
                     });
                 }
@@ -1486,7 +1628,7 @@ fn follow_fuses(host: &mut dyn Host, dimension: &str) {
             }
             if !f.held {
                 f.held = true;
-                hold.push((f.owner.clone(), f.chunks.clone()));
+                hold.push((f.owner, f.chunks.clone()));
             }
             match (f.entity, f.gone) {
                 (Some(id), None) => {
@@ -1508,12 +1650,12 @@ fn follow_fuses(host: &mut dyn Host, dimension: &str) {
     }
     for r in release {
         for chunk in r.chunks {
-            host.chunk_load_release(&r.owner, &r.dimension, chunk);
+            hold_chunk(host, level, &r.owner, chunk, false);
         }
     }
     for (owner, chunks) in hold {
         for chunk in chunks {
-            host.chunk_load_request(&owner, dimension, chunk);
+            hold_chunk(host, level, &owner, chunk, true);
         }
     }
     // The fuses as the TNT itself counts them, and where it is: where its chunk does not tick, it
@@ -1521,10 +1663,10 @@ fn follow_fuses(host: &mut dyn Host, dimension: &str) {
     let read: Vec<(u64, Option<i32>, Option<[i32; 2]>)> = reads
         .into_iter()
         .map(|(fuse, id)| {
-            let left = live_fuse(host, dimension, id);
+            let left = live_fuse(host, id);
             let chunk = host
                 .entity(id)
-                .and_then(|entity| host.entity_position(entity))
+                .and_then(|entity| entity.position(&*host))
                 .map(|at| [(at[0].floor() as i32) >> 4, (at[2].floor() as i32) >> 4]);
             (fuse, left, chunk)
         })
@@ -1532,24 +1674,24 @@ fn follow_fuses(host: &mut dyn Host, dimension: &str) {
     let mut found = Vec::new();
     for (fuse, [x, y, z], left) in wanted {
         let at = [f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5];
-        let near = host.entities_in(
-            dimension,
-            [at[0] - 1.5, at[1] - 1.0, at[2] - 1.5],
-            [at[0] + 1.5, at[1] + 2.0, at[2] + 1.5],
-        );
+        let near = level
+            .entities_in(
+                &*host,
+                [at[0] - 1.5, at[1] - 1.0, at[2] - 1.5],
+                [at[0] + 1.5, at[1] + 2.0, at[2] + 1.5],
+            )
+            .unwrap_or_default();
         // The nearest lit TNT no other fuse holds.
         let mut best: Option<(f64, u32)> = None;
-        for id in near {
+        for entity in near {
+            let id = entity.id();
             if claimed.contains(&id) {
                 continue;
             }
-            let Some(entity) = host.entity(id) else {
-                continue;
-            };
-            if host.entity_kind(entity).as_deref() != Some("minecraft:tnt") {
+            if kind_of(&*host, entity).as_deref() != Some("minecraft:tnt") {
                 continue;
             }
-            let Some(pos) = host.entity_position(entity) else {
+            let Some(pos) = entity.position(&*host) else {
                 continue;
             };
             let d = distance(pos, at);
@@ -1561,7 +1703,7 @@ fn follow_fuses(host: &mut dyn Host, dimension: &str) {
             continue;
         };
         let left = left.clamp(1, i32::from(i16::MAX));
-        if set_fuse(host, dimension, id, left) {
+        if set_fuse(host, id, left) {
             claimed.insert(id);
             found.push((fuse, id, left));
         }
@@ -1581,7 +1723,7 @@ fn follow_fuses(host: &mut dyn Host, dimension: &str) {
                 }
                 if let Some(chunk) = chunk.filter(|c| f.gone.is_none() && !f.chunks.contains(c)) {
                     f.chunks.push(chunk);
-                    extra_holds.push((f.owner.clone(), chunk));
+                    extra_holds.push((f.owner, chunk));
                 }
             }
             if let Some(&(_, id, left)) = found.iter().find(|(fuse, _, _)| *fuse == f.id) {
@@ -1594,30 +1736,30 @@ fn follow_fuses(host: &mut dyn Host, dimension: &str) {
         }
     }
     for (owner, chunk) in extra_holds {
-        host.chunk_load_request(&owner, dimension, chunk);
+        hold_chunk(host, level, &owner, chunk, true);
     }
     // TNT lit in a burning mass since: the same fuse as the mass, so that it all goes off together.
     for (lo, hi, left) in sweep_work {
         if left <= 0 {
             continue;
         }
-        let near = host.entities_in(
-            dimension,
-            [f64::from(lo[0]) - 2.0, f64::from(lo[1]) - 2.0, f64::from(lo[2]) - 2.0],
-            [f64::from(hi[0]) + 3.0, f64::from(hi[1]) + 3.0, f64::from(hi[2]) + 3.0],
-        );
-        for id in near {
+        let near = level
+            .entities_in(
+                &*host,
+                [f64::from(lo[0]) - 2.0, f64::from(lo[1]) - 2.0, f64::from(lo[2]) - 2.0],
+                [f64::from(hi[0]) + 3.0, f64::from(hi[1]) + 3.0, f64::from(hi[2]) + 3.0],
+            )
+            .unwrap_or_default();
+        for entity in near {
+            let id = entity.id();
             if claimed.contains(&id) {
                 continue;
             }
-            let Some(entity) = host.entity(id) else {
-                continue;
-            };
-            if host.entity_kind(entity).as_deref() != Some("minecraft:tnt") {
+            if kind_of(&*host, entity).as_deref() != Some("minecraft:tnt") {
                 continue;
             }
-            if live_fuse(host, dimension, id).is_some_and(|fuse| fuse != left) {
-                set_fuse(host, dimension, id, left);
+            if live_fuse(host, id).is_some_and(|fuse| fuse != left) {
+                set_fuse(host, id, left);
             }
         }
     }
@@ -1625,11 +1767,29 @@ fn follow_fuses(host: &mut dyn Host, dimension: &str) {
 
 /// Gives primed TNT `id` the fuse `left` (in ticks). A merge that changes nothing says false:
 /// then the TNT already had that fuse.
-fn set_fuse(host: &mut dyn Host, dimension: &str, id: u32, left: i32) -> bool {
+fn set_fuse(host: &mut dyn ServerHost, id: u32, left: i32) -> bool {
     let left = left.clamp(1, i32::from(i16::MAX));
+    let Some(entity) = host.entity(id) else {
+        return false;
+    };
     let mut nbt = Compound::new();
     nbt.insert("fuse".into(), Tag::Short(left as i16));
-    host.merge_entity_nbt(dimension, id, nbt) || live_fuse(host, dimension, id) == Some(left)
+    entity.merge_nbt(host, nbt) || live_fuse(host, id) == Some(left)
+}
+
+/// Holds chunk `chunk` (`[x, z]`) of `level` loaded and ticking for `owner`, or lets go of it.
+fn hold_chunk(host: &mut dyn ServerHost, level: LevelRef, owner: &TicketOwner, chunk: [i32; 2], on: bool) {
+    let Some(&controller) = FUSE_TICKETS.get() else {
+        return;
+    };
+    if let Some(chunk) = level.chunk_ref(&*host, chunk) {
+        chunk.set_mod_forced(host, controller, *owner, on, false);
+    }
+}
+
+/// What entity `entity` is (`minecraft:tnt`).
+fn kind_of(host: &dyn Host, entity: EntityRef) -> Option<String> {
+    entity.kind(host).map(|kind| kind.id(host))
 }
 
 /// The primed TNT followed now (the lit TNT of each burning mass), not to be thrown out of its
@@ -1662,56 +1822,80 @@ fn digging_near(digging: &[([f64; 3], f64)], pos: [i32; 3]) -> bool {
     digging.iter().any(|&(center, reach)| distance(center, at) <= reach)
 }
 
-/// The window's countdown over the hotbar: the biggest lit TNT mass whose shockwave could reach
-/// the player at `at` (with a wide margin), in seconds as the server runs them, shown again as each
+/// The countdown over each player's hotbar: the biggest lit TNT mass in their level whose shockwave
+/// could reach them (with a wide margin), in seconds as the server runs them, shown again as each
 /// second passes. When it goes off, the bar says when its shockwave (the boom, the shake and the
-/// push) gets here, or that it won't.
-fn countdown(host: &mut dyn Host, at: [f64; 3], dimension: &str) {
-    let now = WINDOW_TICKS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-    let center_of = |pos: [i32; 3]| [f64::from(pos[0]) + 0.5, f64::from(pos[1]), f64::from(pos[2]) + 0.5];
-    let last = SHOWN_FUSE.load(Ordering::Relaxed);
-    let (shown, went_off) = {
-        let all = fuses();
-        let shown = all
-            .iter()
-            .filter(|f| {
-                f.dimension == dimension && f.entity.is_some() && f.gone.is_none() && f.left > 0
-            })
-            .filter(|f| {
-                let reach = f64::from(shock_range(visual_size(f.mass as f32)));
-                distance(at, center_of(f.pos)) <= reach * 4.0 + COUNTDOWN_MARGIN
-            })
-            .max_by_key(|f| (f.mass, std::cmp::Reverse(f.left)))
-            .map(|f| (f.id, f.mass, f.left));
-        let went_off = all
-            .iter()
-            .find(|f| f.id == last && f.gone.is_some())
-            .map(|f| (f.mass, distance(at, center_of(f.pos))));
-        (shown, went_off)
-    };
-    let Some((id, mass, left)) = shown else {
-        if SHOWN_FUSE.swap(0, Ordering::Relaxed) != 0 {
-            SHOWN_SECS.store(-1, Ordering::Relaxed);
-            let text = went_off.map_or_else(String::new, |(mass, dist)| went_off_text(mass, dist));
-            host.client_action_bar(Text::colored(text, 0xFF_AA_00), false);
-        }
+/// push) gets to them, or that it won't.
+fn countdown(host: &mut dyn ServerHost, level: LevelRef, dimension: &str) {
+    let players = level.online_players(&*host).unwrap_or_default();
+    if players.is_empty() {
         return;
-    };
-    let mut secs = countdown_secs(left, f32::from_bits(SERVER_TPS.load(Ordering::Relaxed)));
-    let same = SHOWN_FUSE.swap(id, Ordering::Relaxed) == id;
-    let before = SHOWN_SECS.load(Ordering::Relaxed);
-    // The same countdown never goes back up (the server's pace wavering by a tick or two).
-    if same && before >= 0 {
-        secs = secs.min(before);
     }
-    let changed = !same || SHOWN_SECS.swap(secs, Ordering::Relaxed) != secs;
-    if !same {
-        SHOWN_SECS.store(secs, Ordering::Relaxed);
+    let now = level.game_time(&*host).unwrap_or(0);
+    let tps = f32::from_bits(SERVER_TPS.load(Ordering::Relaxed));
+    let center_of = |pos: [i32; 3]| [f64::from(pos[0]) + 0.5, f64::from(pos[1]), f64::from(pos[2]) + 0.5];
+    // What to tell whom, decided with the locks held and sent after (a host call may fire a hook).
+    let mut lines: Vec<(PlayerRef, Text)> = Vec::new();
+    {
+        let all = fuses();
+        let mut counted = counted();
+        let counted = counted.get_or_insert_with(HashMap::new);
+        for player in players {
+            let Some(at) = player.entity().position(&*host) else {
+                continue;
+            };
+            let uuid = player.uuid();
+            let last = counted.get(&uuid).copied();
+            let shown = all
+                .iter()
+                .filter(|f| {
+                    f.dimension == dimension && f.entity.is_some() && f.gone.is_none() && f.left > 0
+                })
+                .filter(|f| {
+                    let reach = f64::from(shock_range(visual_size(f.mass as f32)));
+                    distance(at, center_of(f.pos)) <= reach * 4.0 + COUNTDOWN_MARGIN
+                })
+                .max_by_key(|f| (f.mass, std::cmp::Reverse(f.left)))
+                .map(|f| (f.id, f.mass, f.left));
+            let Some((id, mass, left)) = shown else {
+                if let Some(last) = last {
+                    counted.remove(&uuid);
+                    let text = all
+                        .iter()
+                        .find(|f| f.id == last.fuse && f.gone.is_some())
+                        .map_or_else(String::new, |f| {
+                            went_off_text(f.mass, distance(at, center_of(f.pos)))
+                        });
+                    lines.push((player, colored(text, "#FFAA00")));
+                }
+                continue;
+            };
+            let mut secs = countdown_secs(left, tps);
+            let same = last.is_some_and(|l| l.fuse == id);
+            // The same countdown never goes back up (the server's pace wavering by a tick or two).
+            if let Some(last) = last.filter(|_| same) {
+                secs = secs.min(last.secs);
+            }
+            let changed = !same || last.is_some_and(|l| l.secs != secs);
+            let due = last.is_none_or(|l| now.wrapping_sub(l.at) >= COUNTDOWN_RESEND);
+            if changed || due {
+                counted.insert(uuid, Counted { secs, fuse: id, at: now });
+                lines.push((player, colored(countdown_text(mass, secs), "#FF5555")));
+            } else if let Some(last) = last {
+                counted.insert(uuid, Counted { secs, ..last });
+            }
+        }
     }
-    if changed || now.wrapping_sub(SHOWN_AT.load(Ordering::Relaxed)) >= COUNTDOWN_RESEND {
-        SHOWN_AT.store(now, Ordering::Relaxed);
-        host.client_action_bar(Text::colored(countdown_text(mass, secs), 0xFF_55_55), false);
+    for (player, line) in lines {
+        let _ = player.action_bar(host, line);
     }
+}
+
+/// `text` in colour `color` (`#FF5555`).
+fn colored(text: String, color: &str) -> Text {
+    let mut style = TextStyle::default();
+    style.color = Some(color.to_owned());
+    Text::literal(text).with_style(style)
 }
 
 /// What the bar says as a mass of `mass` TNT goes off `dist` blocks away: when its shockwave gets
@@ -1844,20 +2028,19 @@ fn crater_floor(dimension: &str) -> i32 {
 
 /// Digs one ring of a big blast's crater, straight into the chunks: the column empties, and its
 /// new floor chars (soil to coarse dirt, stone to blackstone, molten rock near the middle).
-fn carve(host: &mut dyn Host, dimension: &str, job: &Work, from: f64, to: f64) {
+fn carve(host: &mut dyn ServerHost, dimension: &str, job: &Work, from: f64, to: f64) {
     let radius = crater_radius(job.yield_tnt);
     let floor = crater_floor(dimension);
-    let mut edit = NativeBlockEdit {
-        palette: vec![
-            "minecraft:air".to_owned(),
-            "minecraft:coarse_dirt".to_owned(),
-            "minecraft:blackstone".to_owned(),
-            "minecraft:magma_block".to_owned(),
-        ],
-        filters: vec![
-            "#minecraft:dirt".to_owned(),
-            "#minecraft:base_stone_overworld".to_owned(),
-        ],
+    let palette = ["minecraft:air", "minecraft:coarse_dirt", "minecraft:blackstone", "minecraft:magma_block"];
+    let (Some(palette), Some(filters)) = (
+        states_of(&*host, &palette),
+        tag_filters(&*host, &["minecraft:dirt", "minecraft:base_stone_overworld"]),
+    ) else {
+        return;
+    };
+    let mut edit = BlockEdit {
+        palette,
+        filters,
         ..Default::default()
     };
     for [x, z] in ring_columns(job.center, from, to) {
@@ -1867,7 +2050,7 @@ fn carve(host: &mut dyn Host, dimension: &str, job: &Work, from: f64, to: f64) {
             continue;
         };
         let height = (high - low + 1) as u32;
-        edit.runs.push(NativeBlockRun {
+        edit.runs.push(BlockRun {
             x,
             z,
             y: low,
@@ -1876,7 +2059,7 @@ fn carve(host: &mut dyn Host, dimension: &str, job: &Work, from: f64, to: f64) {
             block: 0,
             only: None,
         });
-        edit.runs.push(NativeBlockRun {
+        edit.runs.push(BlockRun {
             x,
             z,
             y: low - 1,
@@ -1886,7 +2069,7 @@ fn carve(host: &mut dyn Host, dimension: &str, job: &Work, from: f64, to: f64) {
             only: Some(0),
         });
         let molten = r < radius * 0.3 && unit(mix([x, 8, z], job.id), 0) < 0.3;
-        edit.runs.push(NativeBlockRun {
+        edit.runs.push(BlockRun {
             x,
             z,
             y: low - 1,
@@ -1903,18 +2086,17 @@ fn carve(host: &mut dyn Host, dimension: &str, job: &Work, from: f64, to: f64) {
 
 /// Scorches one ring of land round a big blast's crater: plants burn away and soil chars, less of
 /// it the farther out.
-fn scorch_ring(host: &mut dyn Host, dimension: &str, job: &Work, from: f64, to: f64) {
+fn scorch_ring(host: &mut dyn ServerHost, dimension: &str, job: &Work, from: f64, to: f64) {
     let radius = crater_radius(job.yield_tnt);
-    let mut edit = NativeBlockEdit {
-        palette: vec![
-            "minecraft:air".to_owned(),
-            "minecraft:coarse_dirt".to_owned(),
-        ],
-        filters: vec![
-            "#minecraft:replaceable".to_owned(),
-            "#minecraft:flowers".to_owned(),
-            "#minecraft:dirt".to_owned(),
-        ],
+    let (Some(palette), Some(filters)) = (
+        states_of(&*host, &["minecraft:air", "minecraft:coarse_dirt"]),
+        tag_filters(&*host, &["minecraft:replaceable", "minecraft:flowers", "minecraft:dirt"]),
+    ) else {
+        return;
+    };
+    let mut edit = BlockEdit {
+        palette,
+        filters,
         ..Default::default()
     };
     for [x, z] in ring_columns(job.center, from, to) {
@@ -1923,9 +2105,9 @@ fn scorch_ring(host: &mut dyn Host, dimension: &str, job: &Work, from: f64, to: 
         if unit(mix([x, 9, z], job.id), 0) >= chance {
             continue;
         }
-        let surface = Some(NativeHeightmap::MotionBlockingNoLeaves);
+        let surface = Some(Heightmap::MotionBlockingNoLeaves);
         for (y, height, block, only) in [(0, 2, 0, 0), (0, 2, 0, 1), (-1, 1, 1, 2)] {
-            edit.runs.push(NativeBlockRun {
+            edit.runs.push(BlockRun {
                 x,
                 z,
                 y,
@@ -1943,7 +2125,7 @@ fn scorch_ring(host: &mut dyn Host, dimension: &str, job: &Work, from: f64, to: 
 
 /// Throws some of what a big blast's ring is about to dig out: blocks of the ground, flung up and
 /// away, harder the bigger the blast. (Horizon keeps at most 1024 falling blocks in a level.)
-fn ejecta(host: &mut dyn Host, viewers: &[Viewer], dimension: &str, job: &Work, from: f64, to: f64) {
+fn ejecta(host: &mut dyn ServerHost, level: LevelRef, dimension: &str, job: &Work, from: f64, to: f64) {
     let columns = ring_columns(job.center, from, to);
     if columns.is_empty() {
         return;
@@ -1952,27 +2134,24 @@ fn ejecta(host: &mut dyn Host, viewers: &[Viewer], dimension: &str, job: &Work, 
     let ground = job.base[1].floor() as i32 - 1;
     let strength = f64::from(job.yield_tnt.max(1.0)).powf(1.0 / 6.0);
     for (i, &[x, z]) in columns.iter().step_by(step).take(EJECTA_PER_TICK).enumerate() {
-        let name = host.block([x, ground, z]);
+        let name = block_at(&*host, level, [x, ground, z]);
         if !is_debris(&name) {
             continue;
         }
-        let Some(state) = host.default_state(&name) else {
+        let Some(state) = state_of(&*host, &name) else {
             continue;
         };
         let seed = mix([x, ground, z], job.id);
         let from_pos = [f64::from(x) + 0.5, f64::from(ground) + 1.2, f64::from(z) + 0.5];
         let out = throw(job.center, from_pos, 0.7 * strength * (0.7 + 0.6 * unit(seed, 1)));
         let velocity = [out[0], out[1] + 0.4 + 0.5 * unit(seed, 2), out[2]].map(|v| v.clamp(-3.9, 3.9));
-        let falling = NativeFalling {
-            drop_item: false,
-            hurts: true,
-        };
+        let falling = falling(false, true);
         host.spawn_falling_block(dimension, state, from_pos, velocity, falling);
         if i % 3 == 0 {
             emit(
                 host,
-                viewers,
-                Puff::new(ParticleType::LargeSmoke, from_pos, [0.6, 0.4, 0.6], 0.05, 3),
+                level,
+                Puff::new(Particle::LargeSmoke, from_pos, [0.6, 0.4, 0.6], 0.05, 3),
             );
         }
     }
@@ -2155,7 +2334,15 @@ fn may_fly(name: &str) -> bool {
 /// out of the chunks, and throws as much of it as the level takes up and away where players can
 /// see it (Horizon keeps at most 1024 falling blocks in a level: as they land, more fly), the
 /// nearest to them first. Crumbs of it burst round the players near it.
-fn lift(host: &mut dyn Host, viewers: &[Viewer], dimension: &str, job: &Work, from: f64, to: f64) {
+fn lift(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    viewers: &[Viewer],
+    dimension: &str,
+    job: &Work,
+    from: f64,
+    to: f64,
+) {
     let columns = ring_columns(job.center, from, to);
     if columns.is_empty() {
         return;
@@ -2164,7 +2351,7 @@ fn lift(host: &mut dyn Host, viewers: &[Viewer], dimension: &str, job: &Work, fr
     let Ok(read) = host.read_columns(
         dimension,
         &read_at,
-        NativeHeightmap::WorldSurface,
+        Heightmap::WorldSurface,
         (LIFT_DEPTH, 0),
     ) else {
         return;
@@ -2173,8 +2360,9 @@ fn lift(host: &mut dyn Host, viewers: &[Viewer], dimension: &str, job: &Work, fr
     if read.blocks.len() < columns.len() * depth || read.bases.len() < columns.len() {
         return;
     }
-    let covers: Vec<Cover> = read.palette.iter().map(|name| cover_of(name)).collect();
-    let flies: Vec<bool> = read.palette.iter().map(|name| may_fly(name)).collect();
+    let names: Vec<String> = read.palette.iter().map(|&state| name_of(&*host, state)).collect();
+    let covers: Vec<Cover> = names.iter().map(|name| cover_of(name)).collect();
+    let flies: Vec<bool> = names.iter().map(|name| may_fly(name)).collect();
     // Where the players are: the server's, and the window's own in single player.
     let mut watchers: Vec<[f64; 3]> = viewers.iter().map(|v| v.position).collect();
     if let Some((dim, at)) = window_at().as_ref()
@@ -2189,8 +2377,11 @@ fn lift(host: &mut dyn Host, viewers: &[Viewer], dimension: &str, job: &Work, fr
             .map(|w| ((w[0] - at[0]).powi(2) + (w[2] - at[2]).powi(2)).sqrt())
             .fold(f64::INFINITY, f64::min)
     };
-    let mut edit = NativeBlockEdit {
-        palette: vec!["minecraft:air".to_owned()],
+    let Some(air) = state_of(&*host, "minecraft:air") else {
+        return;
+    };
+    let mut edit = BlockEdit {
+        palette: vec![air],
         ..Default::default()
     };
     // What could fly: (how near a player it is, where, which block, how hard it is pushed).
@@ -2220,7 +2411,7 @@ fn lift(host: &mut dyn Host, viewers: &[Viewer], dimension: &str, job: &Work, fr
         let Some((low, high)) = torn_off(&column_covers, base, push) else {
             continue;
         };
-        edit.runs.push(NativeBlockRun {
+        edit.runs.push(BlockRun {
             x,
             z,
             y: low,
@@ -2261,32 +2452,25 @@ fn lift(host: &mut dyn Host, viewers: &[Viewer], dimension: &str, job: &Work, fr
     let mut thrown = 0;
     let mut refused = 0;
     let mut puffs = 0;
-    let mut states: Vec<Option<BlockStateId>> = vec![None; read.palette.len()];
     for &(near, [x, y, z], block, push) in &flying {
         if (thrown >= LIFT_THROWS || refused >= 8) && (puffs >= LIFT_PUFFS || near > 48.0) {
             break;
         }
-        let index = usize::from(block);
-        let state = match states.get(index).copied().flatten() {
-            Some(state) => state,
-            None => {
-                let Some(state) = read.palette.get(index).and_then(|name| host.default_state(name))
-                else {
-                    continue;
-                };
-                states[index] = Some(state);
-                state
-            }
+        // It flies as its block's default state, as a block placed by hand (a waterlogged one lands
+        // dry instead of leaving water where it falls).
+        let Some(state) = read
+            .palette
+            .get(usize::from(block))
+            .and_then(|&state| host.block_state_default(state.block()))
+        else {
+            continue;
         };
         let at = [f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5];
         let seed = mix([x, y, z], job.id ^ 0x5157);
         if thrown < LIFT_THROWS && refused < 8 {
             let out = throw(job.center, at, push.min(3.9) * (0.6 + 0.6 * unit(seed, 0)));
             let velocity = [out[0], out[1] + 0.25 + 0.45 * unit(seed, 1), out[2]].map(|v| v.clamp(-3.9, 3.9));
-            let falling = NativeFalling {
-                drop_item: false,
-                hurts: false,
-            };
+            let falling = falling(false, false);
             if host.spawn_falling_block(dimension, state, at, velocity, falling) {
                 thrown += 1;
                 refused = 0;
@@ -2296,9 +2480,9 @@ fn lift(host: &mut dyn Host, viewers: &[Viewer], dimension: &str, job: &Work, fr
             }
         }
         if puffs < LIFT_PUFFS && near <= 48.0 {
-            let mut puff = Puff::new(ParticleType::Block, at, [0.7, 0.9, 0.7], 0.4, 10);
+            let mut puff = Puff::new(Particle::Block, at, [0.7, 0.9, 0.7], 0.4, 10);
             puff.state = Some(state);
-            emit(host, viewers, puff);
+            emit(host, level, puff);
             puffs += 1;
         }
     }
@@ -2344,29 +2528,29 @@ fn throw(center: [f64; 3], at: [f64; 3], strength: f64) -> [f64; 3] {
 /// it hadn't (`hit`) is hurt and thrown. The window's own player is thrown by the window (`tick`).
 /// The entities reached.
 fn shockwave(
-    host: &mut dyn Host,
-    dimension: &str,
+    host: &mut dyn ServerHost,
+    level: LevelRef,
     job: &Work,
     front: f64,
     hit: &HashSet<u32>,
 ) -> Vec<u32> {
     let c = job.center;
-    let ids = host.entities_in(
-        dimension,
-        [c[0] - front, c[1] - front, c[2] - front],
-        [c[0] + front, c[1] + front, c[2] + front],
-    );
+    let near = level
+        .entities_in(
+            &*host,
+            [c[0] - front, c[1] - front, c[2] - front],
+            [c[0] + front, c[1] + front, c[2] + front],
+        )
+        .unwrap_or_default();
     let mut reached = Vec::new();
     // The lit TNT of a mass still burning stays with its mass, to go off with it.
     let followed = followed_tnt();
-    for id in ids {
+    for entity in near {
+        let id = entity.id();
         if hit.contains(&id) || followed.contains(&id) {
             continue;
         }
-        let Some(entity) = host.entity(id) else {
-            continue;
-        };
-        let Some(at) = host.entity_position(entity) else {
+        let Some(at) = entity.position(&*host) else {
             continue;
         };
         let dist = distance(at, c);
@@ -2378,13 +2562,30 @@ fn shockwave(
             continue;
         };
         if damage >= 0.5 {
-            host.hurt_entity(dimension, id, damage, "minecraft:explosion", None);
+            let _ = entity.hurt(host, "minecraft:explosion", damage, None, None);
         }
-        if host.entity_kind(entity).as_deref() != Some("minecraft:player") {
-            host.entity_push(entity, throw(c, at, push));
+        if kind_of(&*host, entity).as_deref() != Some("minecraft:player") {
+            entity.push(host, throw(c, at, push));
         }
     }
     reached
+}
+
+/// The default states of the blocks named `names`, in order; none if one is unknown.
+fn states_of(host: &dyn Host, names: &[&str]) -> Option<Vec<BlockState>> {
+    names.iter().map(|name| state_of(host, name)).collect()
+}
+
+/// Filters on the block tags `tags` (`minecraft:dirt`), in order; none if one can't be made.
+fn tag_filters(host: &dyn Host, tags: &[&str]) -> Option<Vec<StatePredicate>> {
+    let states = host.block_states();
+    tags.iter()
+        .map(|tag| {
+            let id = Identifier::parse(tag).ok()?;
+            let key = host.tags().key(&id)?;
+            StatePredicate::tag(&states, host.tags(), key, &[]).ok()
+        })
+        .collect()
 }
 
 fn distance(a: [f64; 3], b: [f64; 3]) -> f64 {
@@ -2791,12 +2992,12 @@ mod tests {
     #[test]
     fn yields_add_up_and_everything_grows_with_their_cube_root_without_limit() {
         // One TNT, whatever it stands in.
-        assert_eq!(yield_of(Some("minecraft:tnt")), 1.0);
+        assert_eq!(yield_of(4.0), 1.0);
         assert!((visual_size(1.0) - BASE_SIZE).abs() < 1e-6);
         // A creeper is smaller, an end crystal and a bed bigger.
-        assert!(yield_of(Some("minecraft:creeper")) < 0.5);
-        assert!(yield_of(Some("minecraft:end_crystal")) > 3.0);
-        assert!(yield_of(None) > 1.5);
+        assert!(yield_of(3.0) < 0.5);
+        assert!(yield_of(6.0) > 3.0);
+        assert!(yield_of(5.0) > 1.5);
         // 1000 TNT: ten times the size, the crater and the reach; no limit past it.
         assert!((visual_size(1000.0) - BASE_SIZE * 10.0).abs() < 1e-3);
         assert!((crater_radius(1000.0) - CRATER * 10.0).abs() < 1e-9);
@@ -3026,8 +3227,8 @@ mod tests {
         assert_eq!(all.len(), MAX_FUSES);
         assert!(all.iter().all(|f| f.id != gone));
         assert_eq!(all[0].id, first);
-        // Fuses have their own owners, under the mod's namespace.
-        assert!(all[0].owner.starts_with("realistic_tnt:fuse/"));
+        // Fuses have ticket owners of their own, so that one never lets go of another's chunks.
+        assert_eq!(all[0].owner, fuse_owner(all[0].id));
         assert_ne!(all[0].owner, all[1].owner);
     }
 
@@ -3330,7 +3531,7 @@ mod tests {
         };
         let first = burst([0.5, 64.0, 0.5], 4.0, 4.6);
         assert_eq!(first.len(), 4);
-        assert!(first.iter().all(|p| p.kind != ParticleType::Flash));
+        assert!(first.iter().all(|p| p.kind != Particle::Flash));
         first.iter().for_each(ok);
         let base = [0.5, 64.0, 0.5];
         let mut total = 0;

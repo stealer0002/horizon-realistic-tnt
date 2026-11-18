@@ -1,0 +1,18 @@
+id = "realistic_tnt"
+name = "Realistic TNT"
+version = "0.6.0"
+description = "Explosions with a fireball, mushroom cloud, real craters and a shockwave that flattens what it sweeps over. TNT adds up with no limit."
+authors = ["stealer0002"]
+license = "MIT"
+homepage = "https://github.com/stealer0002/horizon-realistic-tnt"
+issues = "https://github.com/stealer0002/horizon-realistic-tnt/issues"
+# A native mod: Rust in src/, compiled by the launcher against the game build [native] pins.
+api = "0.2"
+# Both: the server digs the crater and throws the debris, the client draws, shakes and plays the boom.
+side = "both"
+capabilities = ["registries"]
+
+[native]
+game = "26.3"
+horizon = "0b14f8acfd97fa2c750e42795249dcc981178ca4"
+mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"

@@ -65,6 +65,16 @@ struct TntCloud {
     grow: f32,
 }
 
+// Shader API 0.2 hands this pass every colour in linear light. The pass's colours were chosen on
+// display values, so it works on the picture encoded with a 2.2 power and decodes what it returns.
+fn tnt_encode(c: vec3<f32>) -> vec3<f32> {
+    return pow(max(c, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
+}
+
+fn tnt_decode(c: vec3<f32>) -> vec3<f32> {
+    return pow(max(c, vec3<f32>(0.0)), vec3<f32>(2.2));
+}
+
 // 1 below `lo`, 0 above `hi`.
 fn tnt_fall(lo: f32, hi: f32, x: f32) -> f32 {
     return 1.0 - smoothstep(lo, hi, x);
@@ -219,7 +229,7 @@ fn tnt_march(dir: vec3<f32>, max_dist: f32, b: TntBlast, jitter: f32) -> vec4<f3
     // Sooty brown at first, a dirty grey as the soot settles out.
     let soot = mix(vec3<f32>(0.17, 0.14, 0.11), vec3<f32>(0.36, 0.34, 0.31), smoothstep(1.0, 8.0, b.t));
     let sun = vec3<f32>(1.0, 0.94, 0.84) * (0.95 * day);
-    let sky = (frame.sky_color * 0.22 + vec3<f32>(0.05, 0.045, 0.04)) * day + vec3<f32>(0.012);
+    let sky = (tnt_encode(frame.sky_color) * 0.22 +vec3<f32>(0.05, 0.045, 0.04)) * day + vec3<f32>(0.012);
     let ember = vec3<f32>(1.0, 0.42, 0.12) * (exp(-b.t / 2.2) * mix(0.75, 0.3, day));
     let toward = frame.light_direction * (b.s * 0.3);
     var trans = 1.0;
@@ -383,14 +393,14 @@ fn post(input: PostInput) -> vec4<f32> {
             crest = crest + bend.z;
         }
     }
-    var colour = input.color.rgb;
+    var colour = tnt_encode(input.color.rgb);
     if crest > 0.001 {
         let lo = vec2<f32>(0.001);
         let hi = vec2<f32>(0.999);
         let red = textureSampleLevel(previous, linear_sampler, clamp(input.uv - offset * 0.9, lo, hi), 0.0).r;
         let green = textureSampleLevel(previous, linear_sampler, clamp(input.uv - offset, lo, hi), 0.0).g;
         let blue = textureSampleLevel(previous, linear_sampler, clamp(input.uv - offset * 1.1, lo, hi), 0.0).b;
-        colour = vec3<f32>(red, green, blue) + vec3<f32>(0.9, 0.85, 0.7) * (crest * 0.05);
+        colour = tnt_encode(vec3<f32>(red, green, blue)) + vec3<f32>(0.9, 0.85, 0.7) * (crest * 0.05);
     }
 
     // A pattern over the pixels that hides the steps of the clouds' marching.
@@ -432,5 +442,5 @@ fn post(input: PostInput) -> vec4<f32> {
             }
         }
     }
-    return vec4<f32>(max(colour, vec3<f32>(0.0)), input.color.a);
+    return vec4<f32>(tnt_decode(colour), 1.0);
 }

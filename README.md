@@ -94,7 +94,7 @@ ends exactly as the TNT goes off. Then it tells you when the shockwave will reac
 **It goes off on time however far you fly.** While a mass burns, the mod holds the chunks round it
 loaded and ticking (the TNT's, the mass's, and out to the land its shockwave tears up, at most 16
 chunks out), so it does not freeze when you leave it behind. The chunks are let go once the crater is
-dug, and none of this is saved with the world.
+dug; a world closed while a mass burns lets go of them when it is opened again.
 
 **The whole mass goes together.** TNT lit later in a mass that is already burning (a second one lit, a
 redstone signal reaching several blocks, fire spreading over it) takes the same fuse, and another
@@ -104,20 +104,21 @@ blast does not throw the lit TNT out of its mass.
 
 Requirements:
 
-- Horizon's launcher, and a game instance it can build native mods into.
-- The mod is pinned to Horizon `main` at commit
-  [`36eb98b`](https://github.com/horizon-rust/horizon/commit/36eb98b6f6ec4f22649cbe65bbfd32bc0dc2083f)
-  (`realistic_tnt/horizon-mixin.toml`).
+- Horizon's launcher 0.2.70 or newer, and a game instance it can build native mods into.
+- The mod is made with the mod SDK of Horizon nightly 2026-11-18
+  ([`0b14f8a`](https://github.com/horizon-rust/horizon/commit/0b14f8acfd97fa2c750e42795249dcc981178ca4),
+  `[native]` in `realistic_tnt/horizon-mod.toml`).
 
 **1. Build the mod into your game.** Native mods are native code with full access to your computer,
-so the launcher asks you to trust them: read the source first (`realistic_tnt/api/src/lib.rs`).
+so the launcher asks you to trust them: read the source first (`realistic_tnt/src/lib.rs`).
 
 ```sh
 horizon-launcher native-build realistic_tnt --instance <your instance> --trust-native-code
 ```
 
-`realistic_tnt/` is the mod's bundle on its own: the launcher reads a bundle strictly, so the shader
-packs, scripts and media live beside it.
+`realistic_tnt/` is the mod's project on its own (the folder a `.hmod` is packed from), so the shader
+packs, scripts and media live beside it. `cargo horizon-mod build` in it writes
+`target/horizon-mod/realistic_tnt.hmod`.
 
 **2. Install a shader pack** for the fireball, the cloud, the flash and the shockwave: copy a pack
 from `shader/` into the game's `shaderpacks/` folder and pick it in Options > Video Settings >
@@ -125,14 +126,14 @@ Shaders.
 
 | Pack | What it is |
 |---|---|
-| `wisdom_horizon_tnt-1.3.7-tnt6.hshader` | Wisdom Shaders V3 (Horizon port) with the explosion pass added: the look in the video |
-| `realistic_tnt_shockwave-0.3.0.hshader` | The explosion pass alone, over the game's vanilla look |
+| `realistic_tnt_shockwave-0.4.0.hshader` | The explosion pass alone, over the game's vanilla look (shader API 0.2) |
+| `wisdom_horizon_tnt-1.3.7-tnt6.hshader` | Wisdom Shaders V3 (Horizon port) with the explosion pass added: the look in the video. It is a shader API 0.1 pack, which Horizon no longer loads since 2026-11-13: kept for older builds only |
 
 Without a shader pack, everything marked "no" in the table above still works.
 
 ## Tuning
 
-The knobs are constants at the top of `realistic_tnt/api/src/lib.rs`:
+The knobs are constants at the top of `realistic_tnt/src/lib.rs`:
 
 | Constant | Default | What it does |
 |---|---|---|
@@ -151,29 +152,30 @@ The knobs are constants at the top of `realistic_tnt/api/src/lib.rs`:
 - Horizon keeps at most 1024 falling blocks in a world: what a big shockwave knocks down flies while
   there is room (as flying blocks land, more fly), only within 160 blocks of a player, and the rest is
   simply gone. It looks 40 blocks down from the top of each column at most.
-- The fireball, cloud, flash, shockwave picture, camera shake, delayed boom and countdown read the
-  blasts from the game's own memory: they work in single player and for the host of a LAN game, not
-  for guests or on a dedicated server. Debris, particles, craters, damage and knockback work everywhere.
+- The fireball, cloud, flash, shockwave picture, camera shake and delayed boom read the blasts from
+  the game's own memory: they work in single player and for the host of a LAN game, not for guests or
+  on a dedicated server. Debris, particles, craters, damage, knockback and the countdown work
+  everywhere.
 - The shockwave throws the window's own player; other players in a LAN game are hurt but not thrown.
 - A world saved and reopened while a mass burns keeps the TNT's long fuse, but not its countdown nor
   its held chunks.
 - The shader pack draws three blasts at a time: the biggest and youngest.
-- In plain single player, particles are seen up to 32 blocks away, as vanilla's are; the fireball and
-  cloud are seen from any distance.
+- Particles are seen up to 32 blocks away, as vanilla's are; the fireball and cloud are seen from any
+  distance.
 - **Photosensitivity:** explosions flash. The pack's "Explosion flash" option at 0 removes the flash.
 
 ## Repository layout
 
 ```
-realistic_tnt/                 the mod's bundle: what `native-build` builds
-  horizon-mixin.toml           id, version, the Horizon commit it is pinned to
-  api/src/lib.rs               the mod: one Rust file, with its unit tests
+realistic_tnt/                 the mod's project: what `native-build` builds and `.hmod` packs
+  horizon-mod.toml             id, version, the Horizon build it is made for
+  src/lib.rs                   the mod: one Rust file, with its unit tests
 shader/
   realistic_tnt_shockwave/     the explosion pass on its own (source)
   wisdom_horizon_tnt/          Wisdom Shaders V3 (Horizon port) with that pass added (source)
   *.hshader                    the same packs, packed, ready to drop into shaderpacks/
 tools/
-  check.ps1                    compiles and unit-tests the mod against a local Horizon checkout
+  check.ps1                    checks and unit-tests the mod with the pinned build's mod SDK
   diagrams.py                  draws media/blast-*.svg from the mod's own formulas
   shoot.py, bigtest.py, ...    drive a test copy of the game through `horizon-ctl` to photograph
                                explosions and check fuses, far-away blasts and torn-up land
@@ -182,7 +184,8 @@ media/                         the clip, its preview and the diagrams
 
 The shader pass and the mod share numbers that must stay the same in both: the layout of `frame.mods`,
 the shockwave's speed (`SHOCK_SPEED`, `TNT_SHOCK_SPEED`), a blast's life (`LIFE_SECS`, `TNT_LIFE`) and
-the curves of the mushroom and of the dust ring. `post/shockwave.wgsl` is the same file in both packs.
+the curves of the mushroom and of the dust ring. `post/shockwave.wgsl` is the same pass in both packs;
+the explosion pack's copy is the shader API 0.2 one, which works in linear light.
 
 ## License and credits
 

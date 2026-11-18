@@ -1,9 +1,0 @@
-[package]
-name = "mod-realistic_tnt"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-# The launcher points this at the Horizon source it builds the game from. Any other
-# dependency must be a crate and version in Horizon's Cargo.lock.
-horizon-client = { git = "https://github.com/horizon-rust/horizon", rev = "36eb98b6f6ec4f22649cbe65bbfd32bc0dc2083f" }
