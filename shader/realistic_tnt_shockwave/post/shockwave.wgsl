@@ -445,6 +445,8 @@ fn post(input: PostInput) -> vec4<f32> {
         colour = tnt_encode(vec3<f32>(red, green, blue)) + vec3<f32>(0.9, 0.85, 0.7) * (crest * 0.05);
     }
 
+    var flash = 0.0;
+    var afterimage = 0.0;
     // A pattern over the pixels that hides the steps of the clouds' marching.
     let jitter = fract(52.9829189 * fract(dot(input.pixel, vec2<f32>(0.06711056, 0.00583715))));
 
@@ -462,9 +464,14 @@ fn post(input: PostInput) -> vec4<f32> {
                 colour = colour * (vec3<f32>(1.0) + vec3<f32>(1.6, 0.9, 0.35) * l)
                     + vec3<f32>(1.0, 0.5, 0.15) * (l * 0.05);
             }
-            let far = length(b.c) / (b.s * 12.0);
-            let flash = tnt_flash * exp(-b.t / 0.07) / (1.0 + far * far);
-            colour = colour * (1.0 + 1.3 * flash) + vec3<f32>(1.0, 0.95, 0.85) * (0.4 * flash);
+            if tnt_flash > 0.0 {
+                let far = length(b.c) / (b.s * 12.0);
+                let intensity = tnt_flash / (1.0 + far * far);
+                flash = max(flash, intensity * exp(-b.t / 0.09));
+                // The iris closes after the peak, then reopens in real time.
+                afterimage = max(afterimage, intensity * smoothstep(0.03, 0.36, b.age)
+                    * exp(-b.age / 1.25));
+            }
 
             // 3. The dust along the ground, then the fireball and its smoke over it.
             let vapor = tnt_vapor(dir, scene_dist, b);
@@ -486,5 +493,8 @@ fn post(input: PostInput) -> vec4<f32> {
             }
         }
     }
-    return vec4<f32>(tnt_decode(colour), 1.0);
+    // Exposure is a gain on linear radiance over the whole composed image.
+    let gain = exp2(2.35 * flash - min(afterimage, 1.0) * 1.25);
+    let exposed = tnt_decode(colour) * gain + vec3<f32>(1.0, 0.94, 0.83) * (flash * 0.75);
+    return vec4<f32>(exposed, 1.0);
 }
