@@ -309,7 +309,7 @@ fn tnt_dust(dir: vec3<f32>, max_dist: f32, b: TntBlast, jitter: f32) -> vec4<f32
     let height = 0.4 + b.s * 0.28 * (1.0 - exp(-b.t / 0.5));
     // The part of the ray between the ground and the dust's top...
     let y0 = b.c.y - 0.4;
-    let y1 = b.c.y + height * 1.5;
+    let y1 = b.c.y + height * 1.8;
     var t0 = 0.0;
     var t1 = max_dist;
     if abs(dir.y) > 0.0001 {
@@ -349,12 +349,15 @@ fn tnt_dust(dir: vec3<f32>, max_dist: f32, b: TntBlast, jitter: f32) -> vec4<f32
         let q = dir * (t0 + (f32(i) + jitter) * dt) - b.c;
         if q.y > -0.5 {
             let rr = length(q.xz);
-            let n = tnt_fbm(vec3<f32>(q.x, q.y * 2.0, q.z) * (3.0 / b.s)
-                + vec3<f32>(b.seed * 5.0, -b.t * 0.8, b.seed * 2.0), 3);
-            let g = (rr - ring) / width;
-            // A wall at the ring, in clumps, and thinner dust left behind it.
-            let wall = exp(-g * g) * smoothstep(0.3, 0.65, n) * 1.6 + 0.25 * tnt_fall(0.0, ring, rr);
-            let lid = tnt_fall(0.0, height * (0.4 + n), q.y);
+            // Sample along the circumference so each lobe travels with the front.
+            let bearing = q.xz / max(rr, 0.05 * b.s);
+            let front_noise = tnt_noise(vec3<f32>(bearing * 4.5, b.seed * 8.0 + b.t * 0.45));
+            let g = (rr - ring) / width - (front_noise - 0.5) * 1.5;
+            let n = tnt_fbm(vec3<f32>(q.x, q.y * 2.0 - g * height * 0.35, q.z) * (3.0 / b.s)
+                + vec3<f32>(b.seed * 5.0, -b.t * 0.8, b.seed * 2.0), select(3, 2, tnt_detail == 0u));
+            let ridge = exp(-2.1 * g * g);
+            let wall = ridge * smoothstep(0.24, 0.66, n) * 1.8 + 0.25 * tnt_fall(0.0, ring, rr);
+            let lid = tnt_fall(0.0, height * (0.32 + 0.78 * n + 0.69 * ridge * front_noise), q.y);
             let a = 1.0 - exp(-wall * lid * (0.35 + n) * 0.6 * fade * dt);
             colour = colour + trans * a * tone * (0.7 + 0.6 * n);
             trans = trans * (1.0 - a);
