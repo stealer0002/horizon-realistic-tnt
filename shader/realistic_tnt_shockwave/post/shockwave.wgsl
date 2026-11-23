@@ -255,6 +255,26 @@ fn tnt_march(dir: vec3<f32>, max_dist: f32, b: TntBlast, jitter: f32) -> vec4<f3
     return vec4<f32>(colour, 1.0 - trans);
 }
 
+// The cold vapor shell is visible mainly at grazing angles. Its lifetime is in
+// real seconds even when the rolling cloud runs on a slower clock.
+fn tnt_vapor(dir: vec3<f32>, scene_dist: f32, b: TntBlast) -> f32 {
+    if b.age >= 1.65 {
+        return 0.0;
+    }
+    let centre = b.c + vec3<f32>(0.0, b.s * 0.24, 0.0);
+    let radius = b.s * (0.18 + 2.2 * (1.0 - exp(-2.3 * b.age)));
+    let along = dot(centre, dir);
+    let radial = dir * along - centre;
+    let edge = (length(radial) - radius) / (0.075 * radius + 0.025 * b.s);
+    if along <= 0.0 || along >= scene_dist || abs(edge) > 2.0 {
+        return 0.0;
+    }
+    let n = tnt_noise(radial * (4.0 / radius) + vec3<f32>(b.seed * 9.0, -b.age, 0.0));
+    let band = tnt_fall(0.1, 1.4, abs(edge + (n - 0.5) * 1.2));
+    let envelope = smoothstep(0.02, 0.12, b.age) * tnt_fall(0.55, 1.65, b.age);
+    return band * envelope * (0.35 + 0.45 * n);
+}
+
 // The dust the blast drives out along the ground: a low, clumpy ring that races out and settles.
 fn tnt_dust(dir: vec3<f32>, max_dist: f32, b: TntBlast, jitter: f32) -> vec4<f32> {
     let fade = exp(-b.t / 1.8) * smoothstep(0.0, 0.1, b.t);
@@ -425,6 +445,8 @@ fn post(input: PostInput) -> vec4<f32> {
             colour = colour * (1.0 + 1.3 * flash) + vec3<f32>(1.0, 0.95, 0.85) * (0.4 * flash);
 
             // 3. The dust along the ground, then the fireball and its smoke over it.
+            let vapor = tnt_vapor(dir, scene_dist, b);
+            colour = mix(colour, vec3<f32>(0.92, 0.96, 1.0), vapor);
             if b.grounded > 0.5 {
                 let dust = tnt_dust(dir, scene_dist, b, jitter);
                 colour = colour * (1.0 - dust.a) + dust.rgb;
