@@ -131,19 +131,39 @@ Shaders.
 
 Without a shader pack, everything marked "no" in the table above still works.
 
+## Command
+
+Use `/tnt <n>` while aiming at a block within 128 blocks. The command requires a player with
+operator level 2 or higher and accepts whole numbers from 1 to 200,000. For example, `/tnt 64`
+sets off one explosion with the yield of 64 TNT at the point your aim hits. It places no TNT
+blocks. Existing TNT touching the explosion can add to its yield as usual.
+
 ## Tuning
 
-The knobs are constants at the top of `realistic_tnt/src/lib.rs`:
+Create `config/realistic_tnt.conf` inside the Horizon instance directory. For a dedicated server,
+use that server's instance directory. The native mod reads the UTF-8 file once during registration.
+Restart Horizon after editing it. You can omit any key to use its default. Blank lines and
+comments beginning with `#` are allowed. Invalid entries are ignored and reported to stderr.
 
-| Constant | Default | What it does |
+```ini
+ESCAPE_SPEED = 10
+MAX_FOLD = 200000
+HOLD_CHUNKS = 16
+LIFT_YIELD = 64
+BREAKS_AT = 0.5, 0.8, 1.5, 2.0
+SCORCH = true
+KNOCKBACK = 1.35
+```
+
+| Key | Accepted values | What it controls |
 |---|---|---|
-| `ESCAPE_SPEED` | 10 blocks/s | How fast you are expected to fly away: the longer a mass's fuse, the lower it is |
-| `MAX_FOLD` | 200,000 | The most TNT blocks one explosion takes in at once |
-| `HOLD_CHUNKS` | 16 | How far out (in chunks) a burning mass keeps the world loaded |
-| `LIFT_YIELD` | 64 TNT | The smallest blast that tears up the land past its crater |
-| `BREAKS_AT` | 0.5 / 0.8 / 1.5 / 2.0 | The shockwave push (blocks a tick) that knocks down glass and plants / wood / turf / brick and stone |
-| `SCORCH` | on | Whether the land round a crater is scorched (it changes the world for good) |
-| `KNOCKBACK` | 1.35 | How much harder the explosion's own push is |
+| `ESCAPE_SPEED` | Positive finite number | Assumed escape speed in blocks per second. Lower values give larger TNT masses a longer fuse. |
+| `MAX_FOLD` | Positive integer | Maximum TNT blocks one explosion takes in at once. |
+| `HOLD_CHUNKS` | Integer from 1 to 32 | Radius cap, in chunks, for the area held around a burning mass. |
+| `LIFT_YIELD` | Positive finite number | Minimum TNT yield that tears up land beyond the crater. |
+| `BREAKS_AT` | Four finite, nonnegative numbers in strictly increasing order | Shockwave push, in blocks per tick, needed to knock down glass and plants, wood, turf, then brick and stone. |
+| `SCORCH` | `true` or `false` | Whether explosions scorch the surrounding land. |
+| `KNOCKBACK` | Finite, nonnegative number | Multiplier for the explosion's initial knockback. |
 
 ## Limits
 
@@ -169,7 +189,9 @@ The knobs are constants at the top of `realistic_tnt/src/lib.rs`:
 ```
 realistic_tnt/                 the mod's project: what `native-build` builds and `.hmod` packs
   horizon-mod.toml             id, version, the Horizon build it is made for
-  src/lib.rs                   the mod: one Rust file, with its unit tests
+  src/lib.rs                   the blast, fuse and effects logic, with unit tests
+  src/command.rs               server-side /tnt command
+  src/config.rs                instance tuning and config parser tests
 shader/
   realistic_tnt_shockwave/     the explosion pass on its own (source)
   wisdom_horizon_tnt/          Wisdom Shaders V3 (Horizon port) with that pass added (source)
