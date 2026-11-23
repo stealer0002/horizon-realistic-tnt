@@ -245,7 +245,10 @@ fn tnt_march(dir: vec3<f32>, max_dist: f32, b: TntBlast, jitter: f32) -> vec4<f3
     let soot = mix(vec3<f32>(0.17, 0.14, 0.11), vec3<f32>(0.36, 0.34, 0.31), smoothstep(1.0, 8.0, b.t));
     let sun = vec3<f32>(1.0, 0.94, 0.84) * (0.95 * day);
     let sky = (tnt_encode(frame.sky_color) * 0.22 +vec3<f32>(0.05, 0.045, 0.04)) * day + vec3<f32>(0.012);
-    let ember = vec3<f32>(1.0, 0.42, 0.12) * (exp(-b.t / 2.2) * mix(0.75, 0.3, day));
+    // Only sunlight behind the smoke produces a bright forward-scattering rim.
+    let backlight = smoothstep(0.35, 0.92, dot(dir, frame.sun_direction))
+        * smoothstep(-0.04, 0.15, frame.sun_direction.y);
+    let embers = vec3<f32>(1.0, 0.36, 0.08) * exp(-b.t / 2.2) * mix(0.85, 0.58, day);
     let toward = frame.light_direction * (b.s * 0.3);
     var trans = 1.0;
     var colour = vec3<f32>(0.0);
@@ -257,9 +260,13 @@ fn tnt_march(dir: vec3<f32>, max_dist: f32, b: TntBlast, jitter: f32) -> vec4<f3
             // A step toward the sun (or the moon): thick smoke that way leaves this spot in
             // the cloud's own shadow.
             let lit = exp(-tnt_shape(q + toward, b, cl, 2).x * 2.6);
-            // The fire lights the smoke from below.
-            let under = 1.0 - clamp(q.y / (cl.yc + cl.rc), 0.0, 1.0);
-            let c = soot * (sky + sun * lit) * (0.75 + 0.5 * shape.z) + ember * under + tnt_fire(shape.y) * 2.2;
+            // Reuse the sun probe: dense interior samples stay in shadow.
+            let rim = backlight * lit * (1.0 - 0.7 * shape.x);
+            let under = tnt_fall(-0.4, 0.22, (q.y - cl.yc) / cl.rc);
+            let below = under / (1.0 + dot(q.xz, q.xz) / (cl.rc * cl.rc));
+            let c = soot * (sky + sun * lit) * (0.75 + 0.5 * shape.z)
+                + vec3<f32>(1.0, 0.91, 0.71) * rim * 0.85
+                + embers * below + tnt_fire(shape.y) * 2.2;
             colour = colour + trans * a * c;
             trans = trans * (1.0 - a);
             if trans < 0.03 {
