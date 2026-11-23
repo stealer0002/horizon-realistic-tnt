@@ -63,6 +63,9 @@ struct TntCloud {
     rs: f32,
     // 0 as it goes off, 1 a moment later.
     grow: f32,
+    // Cross-section rotation and transition from the young fireball to the vortex.
+    roll: vec2<f32>,
+    vortex: f32,
 }
 
 // Shader API 0.2 hands this pass every colour in linear light. The pass's colours were chosen on
@@ -157,22 +160,34 @@ fn tnt_cloud(b: TntBlast) -> TntCloud {
     cl.yc = b.s * (0.4 + 1.5 * rise);
     cl.rc = b.s * (0.3 + 0.75 * cl.grow) * (1.0 + 0.06 * b.t);
     cl.rs = b.s * (0.22 + 0.12 * cl.grow) * (1.0 + 0.05 * b.t);
+    let angle = b.t * 1.5 / (1.0 + 0.08 * b.t);
+    cl.roll = vec2<f32>(cos(angle), sin(angle));
+    cl.vortex = smoothstep(0.25, 1.25, b.t);
     return cl;
 }
 
 // The cloud at `q` (relative to where the blast went off): how thick it is, how hot, and the
 // noise that shaped it there. `octaves` of noise: fewer for the shadow probe.
 fn tnt_shape(q: vec3<f32>, b: TntBlast, cl: TntCloud, octaves: i32) -> vec3<f32> {
-    // The noise drifts up through the cloud, so it seems to roll. It puffs the cloud out where
-    // it is high and pinches it in between: billows, with a crisp edge.
-    let n = tnt_fbm(q * (2.0 / b.s) + vec3<f32>(b.seed * 7.3, -b.t * 0.55, b.seed * 3.1), octaves);
+    let rr = length(q.xz);
+    let dy = q.y - cl.yc;
+    let core = cl.rc * 0.59;
+    let tube = vec2<f32>(rr - core, dy);
+    let ball = length(vec2<f32>(rr, dy * 1.25)) / cl.rc;
+    let torus = length(tube * vec2<f32>(1.0, 1.08)) / (cl.rc * 0.49);
+    let e = mix(ball, torus, cl.vortex);
+
+    // Trace the noise backwards around the tube: billows rise on the inside,
+    // turn over the crown, and descend at the outer edge.
+    let turned = vec2<f32>(dot(tube, vec2<f32>(cl.roll.x, -cl.roll.y)), dot(tube, cl.roll.yx));
+    let unit = q.xz / max(rr, 0.001 * b.s);
+    let weight = cl.vortex * tnt_fall(1.0, 1.65, torus) * smoothstep(0.03, 0.2, rr / cl.rc);
+    let shift = (turned - tube) * weight;
+    let sample_pos = q + vec3<f32>(unit.x * shift.x, shift.y, unit.y * shift.x);
+    let n = tnt_fbm(sample_pos * (2.0 / b.s) + vec3<f32>(b.seed * 7.3, -b.t * 0.55, b.seed * 3.1), octaves);
     let puff = (n - 0.5) * 1.4;
-    // The cap: a flattened ball.
-    let d = q - vec3<f32>(0.0, cl.yc, 0.0);
-    let e = length(vec3<f32>(d.x, d.y * 1.25, d.z)) / cl.rc;
     let cap = tnt_fall(0.8, 1.0, e + puff);
     // The stem under it, wide and ragged.
-    let rr = length(q.xz);
     let span = smoothstep(-0.4, 0.5, q.y) * tnt_fall(cl.yc - cl.rc * 0.4, cl.yc + cl.rc * 0.1, q.y);
     let stem = tnt_fall(cl.rs * 0.8, cl.rs * 1.4, rr + puff * cl.rs * 1.8) * span * 0.8;
     // What stays low where it went off: dust and smoke round the crater.
