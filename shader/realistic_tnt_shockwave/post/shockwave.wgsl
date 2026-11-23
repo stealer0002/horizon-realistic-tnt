@@ -63,6 +63,9 @@ struct TntCloud {
     rs: f32,
     // 0 as it goes off, 1 a moment later.
     grow: f32,
+    // Cross-section rotation and transition from the young fireball to the vortex.
+    roll: vec2<f32>,
+    vortex: f32,
 }
 
 // Shader API 0.2 hands this pass every colour in linear light. The pass's colours were chosen on
@@ -157,22 +160,34 @@ fn tnt_cloud(b: TntBlast) -> TntCloud {
     cl.yc = b.s * (0.4 + 1.5 * rise);
     cl.rc = b.s * (0.3 + 0.75 * cl.grow) * (1.0 + 0.06 * b.t);
     cl.rs = b.s * (0.22 + 0.12 * cl.grow) * (1.0 + 0.05 * b.t);
+    let angle = b.t * 1.5 / (1.0 + 0.08 * b.t);
+    cl.roll = vec2<f32>(cos(angle), sin(angle));
+    cl.vortex = smoothstep(0.25, 1.25, b.t);
     return cl;
 }
 
 // The cloud at `q` (relative to where the blast went off): how thick it is, how hot, and the
 // noise that shaped it there. `octaves` of noise: fewer for the shadow probe.
 fn tnt_shape(q: vec3<f32>, b: TntBlast, cl: TntCloud, octaves: i32) -> vec3<f32> {
-    // The noise drifts up through the cloud, so it seems to roll. It puffs the cloud out where
-    // it is high and pinches it in between: billows, with a crisp edge.
-    let n = tnt_fbm(q * (2.0 / b.s) + vec3<f32>(b.seed * 7.3, -b.t * 0.55, b.seed * 3.1), octaves);
+    let rr = length(q.xz);
+    let dy = q.y - cl.yc;
+    let core = cl.rc * 0.59;
+    let tube = vec2<f32>(rr - core, dy);
+    let ball = length(vec2<f32>(rr, dy * 1.25)) / cl.rc;
+    let torus = length(tube * vec2<f32>(1.0, 1.08)) / (cl.rc * 0.49);
+    let e = mix(ball, torus, cl.vortex);
+
+    // Trace the noise backwards around the tube: billows rise on the inside,
+    // turn over the crown, and descend at the outer edge.
+    let turned = vec2<f32>(dot(tube, vec2<f32>(cl.roll.x, -cl.roll.y)), dot(tube, cl.roll.yx));
+    let unit = q.xz / max(rr, 0.001 * b.s);
+    let weight = cl.vortex * tnt_fall(1.0, 1.65, torus) * smoothstep(0.03, 0.2, rr / cl.rc);
+    let shift = (turned - tube) * weight;
+    let sample_pos = q + vec3<f32>(unit.x * shift.x, shift.y, unit.y * shift.x);
+    let n = tnt_fbm(sample_pos * (2.0 / b.s) + vec3<f32>(b.seed * 7.3, -b.t * 0.55, b.seed * 3.1), octaves);
     let puff = (n - 0.5) * 1.4;
-    // The cap: a flattened ball.
-    let d = q - vec3<f32>(0.0, cl.yc, 0.0);
-    let e = length(vec3<f32>(d.x, d.y * 1.25, d.z)) / cl.rc;
     let cap = tnt_fall(0.8, 1.0, e + puff);
     // The stem under it, wide and ragged.
-    let rr = length(q.xz);
     let span = smoothstep(-0.4, 0.5, q.y) * tnt_fall(cl.yc - cl.rc * 0.4, cl.yc + cl.rc * 0.1, q.y);
     let stem = tnt_fall(cl.rs * 0.8, cl.rs * 1.4, rr + puff * cl.rs * 1.8) * span * 0.8;
     // What stays low where it went off: dust and smoke round the crater.
@@ -230,7 +245,10 @@ fn tnt_march(dir: vec3<f32>, max_dist: f32, b: TntBlast, jitter: f32) -> vec4<f3
     let soot = mix(vec3<f32>(0.17, 0.14, 0.11), vec3<f32>(0.36, 0.34, 0.31), smoothstep(1.0, 8.0, b.t));
     let sun = vec3<f32>(1.0, 0.94, 0.84) * (0.95 * day);
     let sky = (tnt_encode(frame.sky_color) * 0.22 +vec3<f32>(0.05, 0.045, 0.04)) * day + vec3<f32>(0.012);
-    let ember = vec3<f32>(1.0, 0.42, 0.12) * (exp(-b.t / 2.2) * mix(0.75, 0.3, day));
+    // Only sunlight behind the smoke produces a bright forward-scattering rim.
+    let backlight = smoothstep(0.35, 0.92, dot(dir, frame.sun_direction))
+        * smoothstep(-0.04, 0.15, frame.sun_direction.y);
+    let embers = vec3<f32>(1.0, 0.36, 0.08) * exp(-b.t / 2.2) * mix(0.85, 0.58, day);
     let toward = frame.light_direction * (b.s * 0.3);
     var trans = 1.0;
     var colour = vec3<f32>(0.0);
@@ -242,9 +260,13 @@ fn tnt_march(dir: vec3<f32>, max_dist: f32, b: TntBlast, jitter: f32) -> vec4<f3
             // A step toward the sun (or the moon): thick smoke that way leaves this spot in
             // the cloud's own shadow.
             let lit = exp(-tnt_shape(q + toward, b, cl, 2).x * 2.6);
-            // The fire lights the smoke from below.
-            let under = 1.0 - clamp(q.y / (cl.yc + cl.rc), 0.0, 1.0);
-            let c = soot * (sky + sun * lit) * (0.75 + 0.5 * shape.z) + ember * under + tnt_fire(shape.y) * 2.2;
+            // Reuse the sun probe: dense interior samples stay in shadow.
+            let rim = backlight * lit * (1.0 - 0.7 * shape.x);
+            let under = tnt_fall(-0.4, 0.22, (q.y - cl.yc) / cl.rc);
+            let below = under / (1.0 + dot(q.xz, q.xz) / (cl.rc * cl.rc));
+            let c = soot * (sky + sun * lit) * (0.75 + 0.5 * shape.z)
+                + vec3<f32>(1.0, 0.91, 0.71) * rim * 0.85
+                + embers * below + tnt_fire(shape.y) * 2.2;
             colour = colour + trans * a * c;
             trans = trans * (1.0 - a);
             if trans < 0.03 {
@@ -253,6 +275,26 @@ fn tnt_march(dir: vec3<f32>, max_dist: f32, b: TntBlast, jitter: f32) -> vec4<f3
         }
     }
     return vec4<f32>(colour, 1.0 - trans);
+}
+
+// The cold vapor shell is visible mainly at grazing angles. Its lifetime is in
+// real seconds even when the rolling cloud runs on a slower clock.
+fn tnt_vapor(dir: vec3<f32>, scene_dist: f32, b: TntBlast) -> f32 {
+    if b.age >= 1.65 {
+        return 0.0;
+    }
+    let centre = b.c + vec3<f32>(0.0, b.s * 0.24, 0.0);
+    let radius = b.s * (0.18 + 2.2 * (1.0 - exp(-2.3 * b.age)));
+    let along = dot(centre, dir);
+    let radial = dir * along - centre;
+    let edge = (length(radial) - radius) / (0.075 * radius + 0.025 * b.s);
+    if along <= 0.0 || along >= scene_dist || abs(edge) > 2.0 {
+        return 0.0;
+    }
+    let n = tnt_noise(radial * (4.0 / radius) + vec3<f32>(b.seed * 9.0, -b.age, 0.0));
+    let band = tnt_fall(0.1, 1.4, abs(edge + (n - 0.5) * 1.2));
+    let envelope = smoothstep(0.02, 0.12, b.age) * tnt_fall(0.55, 1.65, b.age);
+    return band * envelope * (0.35 + 0.45 * n);
 }
 
 // The dust the blast drives out along the ground: a low, clumpy ring that races out and settles.
@@ -267,7 +309,7 @@ fn tnt_dust(dir: vec3<f32>, max_dist: f32, b: TntBlast, jitter: f32) -> vec4<f32
     let height = 0.4 + b.s * 0.28 * (1.0 - exp(-b.t / 0.5));
     // The part of the ray between the ground and the dust's top...
     let y0 = b.c.y - 0.4;
-    let y1 = b.c.y + height * 1.5;
+    let y1 = b.c.y + height * 1.8;
     var t0 = 0.0;
     var t1 = max_dist;
     if abs(dir.y) > 0.0001 {
@@ -307,12 +349,15 @@ fn tnt_dust(dir: vec3<f32>, max_dist: f32, b: TntBlast, jitter: f32) -> vec4<f32
         let q = dir * (t0 + (f32(i) + jitter) * dt) - b.c;
         if q.y > -0.5 {
             let rr = length(q.xz);
-            let n = tnt_fbm(vec3<f32>(q.x, q.y * 2.0, q.z) * (3.0 / b.s)
-                + vec3<f32>(b.seed * 5.0, -b.t * 0.8, b.seed * 2.0), 3);
-            let g = (rr - ring) / width;
-            // A wall at the ring, in clumps, and thinner dust left behind it.
-            let wall = exp(-g * g) * smoothstep(0.3, 0.65, n) * 1.6 + 0.25 * tnt_fall(0.0, ring, rr);
-            let lid = tnt_fall(0.0, height * (0.4 + n), q.y);
+            // Sample along the circumference so each lobe travels with the front.
+            let bearing = q.xz / max(rr, 0.05 * b.s);
+            let front_noise = tnt_noise(vec3<f32>(bearing * 4.5, b.seed * 8.0 + b.t * 0.45));
+            let g = (rr - ring) / width - (front_noise - 0.5) * 1.5;
+            let n = tnt_fbm(vec3<f32>(q.x, q.y * 2.0 - g * height * 0.35, q.z) * (3.0 / b.s)
+                + vec3<f32>(b.seed * 5.0, -b.t * 0.8, b.seed * 2.0), select(3, 2, tnt_detail == 0u));
+            let ridge = exp(-2.1 * g * g);
+            let wall = ridge * smoothstep(0.24, 0.66, n) * 1.8 + 0.25 * tnt_fall(0.0, ring, rr);
+            let lid = tnt_fall(0.0, height * (0.32 + 0.78 * n + 0.69 * ridge * front_noise), q.y);
             let a = 1.0 - exp(-wall * lid * (0.35 + n) * 0.6 * fade * dt);
             colour = colour + trans * a * tone * (0.7 + 0.6 * n);
             trans = trans * (1.0 - a);
@@ -363,6 +408,27 @@ fn tnt_shock(uv: vec2<f32>, dir: vec3<f32>, scene_dist: f32, ground: bool, b: Tn
     return vec3<f32>(outward * vec2<f32>(1.0 / aspect, 1.0) * pull, band);
 }
 
+// Refract the background only where the ray crosses hot air around the fire.
+fn tnt_heat_haze(dir: vec3<f32>, scene_dist: f32, b: TntBlast) -> vec2<f32> {
+    if tnt_distortion <= 0.0 || b.t >= 2.8 {
+        return vec2<f32>(0.0);
+    }
+    let cl = tnt_cloud(b);
+    let centre = b.c + vec3<f32>(0.0, cl.yc, 0.0);
+    let along = dot(dir, centre);
+    let q = (dir * along - centre) / cl.rc;
+    let r = length(q);
+    if along <= 0.0 || scene_dist <= along || r >= 1.65 {
+        return vec2<f32>(0.0);
+    }
+    let envelope = smoothstep(0.22, 0.72, r) * tnt_fall(0.94, 1.65, r)
+        * smoothstep(0.02, 0.16, b.t) * tnt_fall(0.6, 2.8, b.t);
+    let phase = tnt_noise(q * 4.0 + vec3<f32>(b.seed * 6.0, -b.age * 2.8, 0.0));
+    let wobble = vec2<f32>(sin(12.0 * q.y + 5.0 * phase), phase * 2.0 - 1.0);
+    let aspect = frame.resolution.y / frame.resolution.x;
+    return wobble * vec2<f32>(aspect, 1.0) * (0.021 * min(cl.rc / along, 0.7) * envelope * tnt_distortion);
+}
+
 fn post(input: PostInput) -> vec4<f32> {
     var busy = false;
     for (var k = 0; k < 3; k = k + 1) {
@@ -386,23 +452,32 @@ fn post(input: PostInput) -> vec4<f32> {
     // 1. The shockwaves bend the picture, the colours a little apart (as a lens does).
     var offset = vec2<f32>(0.0);
     var crest = 0.0;
+    var haze = vec2<f32>(0.0);
     for (var k = 0; k < 3; k = k + 1) {
         if tnt_live(k) {
-            let bend = tnt_shock(input.uv, dir, scene_dist, ground, tnt_blast(k, eye), eye);
+            let b = tnt_blast(k, eye);
+            let bend = tnt_shock(input.uv, dir, scene_dist, ground, b, eye);
+            haze += tnt_heat_haze(dir, scene_dist, b);
             offset = offset + bend.xy;
             crest = crest + bend.z;
         }
     }
     var colour = tnt_encode(input.color.rgb);
+    let heated_uv = input.uv - haze;
     if crest > 0.001 {
         let lo = vec2<f32>(0.001);
         let hi = vec2<f32>(0.999);
-        let red = textureSampleLevel(previous, linear_sampler, clamp(input.uv - offset * 0.9, lo, hi), 0.0).r;
-        let green = textureSampleLevel(previous, linear_sampler, clamp(input.uv - offset, lo, hi), 0.0).g;
-        let blue = textureSampleLevel(previous, linear_sampler, clamp(input.uv - offset * 1.1, lo, hi), 0.0).b;
+        let red = textureSampleLevel(previous, linear_sampler, clamp(heated_uv - offset * 0.9, lo, hi), 0.0).r;
+        let green = textureSampleLevel(previous, linear_sampler, clamp(heated_uv - offset, lo, hi), 0.0).g;
+        let blue = textureSampleLevel(previous, linear_sampler, clamp(heated_uv - offset * 1.1, lo, hi), 0.0).b;
         colour = tnt_encode(vec3<f32>(red, green, blue)) + vec3<f32>(0.9, 0.85, 0.7) * (crest * 0.05);
+    } else if dot(haze, haze) > 1e-12 {
+        colour = tnt_encode(textureSampleLevel(previous, linear_sampler,
+            clamp(heated_uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).rgb);
     }
 
+    var flash = 0.0;
+    var afterimage = 0.0;
     // A pattern over the pixels that hides the steps of the clouds' marching.
     let jitter = fract(52.9829189 * fract(dot(input.pixel, vec2<f32>(0.06711056, 0.00583715))));
 
@@ -420,11 +495,18 @@ fn post(input: PostInput) -> vec4<f32> {
                 colour = colour * (vec3<f32>(1.0) + vec3<f32>(1.6, 0.9, 0.35) * l)
                     + vec3<f32>(1.0, 0.5, 0.15) * (l * 0.05);
             }
-            let far = length(b.c) / (b.s * 12.0);
-            let flash = tnt_flash * exp(-b.t / 0.07) / (1.0 + far * far);
-            colour = colour * (1.0 + 1.3 * flash) + vec3<f32>(1.0, 0.95, 0.85) * (0.4 * flash);
+            if tnt_flash > 0.0 {
+                let far = length(b.c) / (b.s * 12.0);
+                let intensity = tnt_flash / (1.0 + far * far);
+                flash = max(flash, intensity * exp(-b.t / 0.09));
+                // The iris closes after the peak, then reopens in real time.
+                afterimage = max(afterimage, intensity * smoothstep(0.03, 0.36, b.age)
+                    * exp(-b.age / 1.25));
+            }
 
             // 3. The dust along the ground, then the fireball and its smoke over it.
+            let vapor = tnt_vapor(dir, scene_dist, b);
+            colour = mix(colour, vec3<f32>(0.92, 0.96, 1.0), vapor);
             if b.grounded > 0.5 {
                 let dust = tnt_dust(dir, scene_dist, b, jitter);
                 colour = colour * (1.0 - dust.a) + dust.rgb;
@@ -442,5 +524,8 @@ fn post(input: PostInput) -> vec4<f32> {
             }
         }
     }
-    return vec4<f32>(tnt_decode(colour), 1.0);
+    // Exposure is a gain on linear radiance over the whole composed image.
+    let gain = exp2(2.35 * flash - min(afterimage, 1.0) * 1.25);
+    let exposed = tnt_decode(colour) * gain + vec3<f32>(1.0, 0.94, 0.83) * (flash * 0.75);
+    return vec4<f32>(exposed, 1.0);
 }
