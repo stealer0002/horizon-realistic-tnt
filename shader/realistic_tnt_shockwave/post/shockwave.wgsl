@@ -405,6 +405,27 @@ fn tnt_shock(uv: vec2<f32>, dir: vec3<f32>, scene_dist: f32, ground: bool, b: Tn
     return vec3<f32>(outward * vec2<f32>(1.0 / aspect, 1.0) * pull, band);
 }
 
+// Refract the background only where the ray crosses hot air around the fire.
+fn tnt_heat_haze(dir: vec3<f32>, scene_dist: f32, b: TntBlast) -> vec2<f32> {
+    if tnt_distortion <= 0.0 || b.t >= 2.8 {
+        return vec2<f32>(0.0);
+    }
+    let cl = tnt_cloud(b);
+    let centre = b.c + vec3<f32>(0.0, cl.yc, 0.0);
+    let along = dot(dir, centre);
+    let q = (dir * along - centre) / cl.rc;
+    let r = length(q);
+    if along <= 0.0 || scene_dist <= along || r >= 1.65 {
+        return vec2<f32>(0.0);
+    }
+    let envelope = smoothstep(0.22, 0.72, r) * tnt_fall(0.94, 1.65, r)
+        * smoothstep(0.02, 0.16, b.t) * tnt_fall(0.6, 2.8, b.t);
+    let phase = tnt_noise(q * 4.0 + vec3<f32>(b.seed * 6.0, -b.age * 2.8, 0.0));
+    let wobble = vec2<f32>(sin(12.0 * q.y + 5.0 * phase), phase * 2.0 - 1.0);
+    let aspect = frame.resolution.y / frame.resolution.x;
+    return wobble * vec2<f32>(aspect, 1.0) * (0.021 * min(cl.rc / along, 0.7) * envelope * tnt_distortion);
+}
+
 fn post(input: PostInput) -> vec4<f32> {
     var busy = false;
     for (var k = 0; k < 3; k = k + 1) {
@@ -428,21 +449,28 @@ fn post(input: PostInput) -> vec4<f32> {
     // 1. The shockwaves bend the picture, the colours a little apart (as a lens does).
     var offset = vec2<f32>(0.0);
     var crest = 0.0;
+    var haze = vec2<f32>(0.0);
     for (var k = 0; k < 3; k = k + 1) {
         if tnt_live(k) {
-            let bend = tnt_shock(input.uv, dir, scene_dist, ground, tnt_blast(k, eye), eye);
+            let b = tnt_blast(k, eye);
+            let bend = tnt_shock(input.uv, dir, scene_dist, ground, b, eye);
+            haze += tnt_heat_haze(dir, scene_dist, b);
             offset = offset + bend.xy;
             crest = crest + bend.z;
         }
     }
     var colour = tnt_encode(input.color.rgb);
+    let heated_uv = input.uv - haze;
     if crest > 0.001 {
         let lo = vec2<f32>(0.001);
         let hi = vec2<f32>(0.999);
-        let red = textureSampleLevel(previous, linear_sampler, clamp(input.uv - offset * 0.9, lo, hi), 0.0).r;
-        let green = textureSampleLevel(previous, linear_sampler, clamp(input.uv - offset, lo, hi), 0.0).g;
-        let blue = textureSampleLevel(previous, linear_sampler, clamp(input.uv - offset * 1.1, lo, hi), 0.0).b;
+        let red = textureSampleLevel(previous, linear_sampler, clamp(heated_uv - offset * 0.9, lo, hi), 0.0).r;
+        let green = textureSampleLevel(previous, linear_sampler, clamp(heated_uv - offset, lo, hi), 0.0).g;
+        let blue = textureSampleLevel(previous, linear_sampler, clamp(heated_uv - offset * 1.1, lo, hi), 0.0).b;
         colour = tnt_encode(vec3<f32>(red, green, blue)) + vec3<f32>(0.9, 0.85, 0.7) * (crest * 0.05);
+    } else if dot(haze, haze) > 1e-12 {
+        colour = tnt_encode(textureSampleLevel(previous, linear_sampler,
+            clamp(heated_uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).rgb);
     }
 
     var flash = 0.0;
