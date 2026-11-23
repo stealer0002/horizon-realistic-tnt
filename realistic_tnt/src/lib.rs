@@ -24,6 +24,8 @@
 //! from process memory, so they work in single player and for the host of a LAN game, not for
 //! guests or on a dedicated server. The countdown over the hotbar is sent by the server, so every
 //! player sees it. Particles reach 32 blocks, as vanilla's do.
+mod command;
+
 use mod_api::{
     BlockEdit, BlockRun, BlockState, BlockUpdateFlags, CameraShakeEvent, ClientHost,
     ClientTickPostEvent, Compound, EntityRef, ExplosionDetonateEvent, ExplosionKnockbackEvent,
@@ -425,6 +427,14 @@ impl Hooks for Mod {
         // The particles it sends, and the controller that holds the chunks of a burning mass.
         let _ = PARTICLES.set(Particle::ALL.map(|p| registrar.particle_key(p.id())));
         let _ = FUSE_TICKETS.set(registrar.register_ticket_controller("realistic_tnt:fuse", true));
+    }
+
+    fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut mod_api::RegisterCommandsEvent<'_>) {
+        command::register(event);
+    }
+
+    fn run_mod_command(&self, host: &mut dyn ServerHost, event: &mut mod_api::RunModCommandEvent<'_>) -> Flow {
+        command::run(host, event)
     }
 
     fn validate_tickets(&self, _host: &mut dyn ServerHost, event: &mut ValidateTicketsEvent<'_>) {
