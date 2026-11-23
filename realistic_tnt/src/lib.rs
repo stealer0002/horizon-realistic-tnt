@@ -25,6 +25,7 @@
 //! guests or on a dedicated server. The countdown over the hotbar is sent by the server, so every
 //! player sees it. Particles reach 32 blocks, as vanilla's do.
 mod command;
+mod config;
 
 use mod_api::{
     BlockEdit, BlockRun, BlockState, BlockUpdateFlags, CameraShakeEvent, ClientHost,
@@ -423,7 +424,8 @@ struct Mod;
 
 #[mod_api::horizon_mod]
 impl Hooks for Mod {
-    fn register(&self, registrar: &mut dyn Registrar, _context: &RegistrationContext) {
+    fn register(&self, registrar: &mut dyn Registrar, context: &RegistrationContext) {
+        config::load(context);
         // The particles it sends, and the controller that holds the chunks of a burning mass.
         let _ = PARTICLES.set(Particle::ALL.map(|p| registrar.particle_key(p.id())));
         let _ = FUSE_TICKETS.set(registrar.register_ticket_controller("realistic_tnt:fuse", true));
@@ -471,7 +473,7 @@ impl Hooks for Mod {
         // TNT blocks touching it go off with it, now, instead of one by one after it.
         let folded = {
             let look = |pos| block_at(&*host, level, pos);
-            tnt_cluster(&look, cell, MAX_FOLD)
+            tnt_cluster(&look, cell, config::get().max_fold)
         };
         if !folded.is_empty() {
             remove_blocks(host, &dimension, &folded);
@@ -560,7 +562,7 @@ impl Hooks for Mod {
         }
 
         // Remember it. A big one scorches the land round its crater as it digs (`carve`).
-        let scorch = if SCORCH && ground.is_some() && !big {
+        let scorch = if config::get().scorch && ground.is_some() && !big {
             scorch_columns(center, power)
         } else {
             Vec::new()
@@ -615,7 +617,7 @@ impl Hooks for Mod {
         }
         let cluster = {
             let look = |pos| block_at(&*host, level, pos);
-            tnt_cluster(&look, cell, MAX_FOLD)
+            tnt_cluster(&look, cell, config::get().max_fold)
         };
         let mass = mass_of(&cluster, cell);
         let total = fuse_ticks(mass as f32);
@@ -662,7 +664,7 @@ impl Hooks for Mod {
             .filter(|b| b.dimension == event.dimension && b.ticks <= MERGE_TICKS)
             .find(|b| distance(b.center, event.center) <= crater_radius(b.yield_tnt) + 6.0)
             .map_or(1.0, |b| b.yield_tnt);
-        let factor = KNOCKBACK * f64::from(yield_tnt.max(1.0)).cbrt();
+        let factor = config::get().knockback * f64::from(yield_tnt.max(1.0)).cbrt();
         for axis in event.knockback_velocity.iter_mut() {
             *axis = (*axis * factor).clamp(-3.9, 3.9);
         }
@@ -718,14 +720,14 @@ impl Hooks for Mod {
                     blast.carved = to;
                     ring
                 });
-                let scorch_ring = (blast.big && blast.scorched < radius * 1.7).then(|| {
+                let scorch_ring = (config::get().scorch && blast.big && blast.scorched < radius * 1.7).then(|| {
                     let to = capped_ring(blast.scorched, front.min(radius * 1.7), CARVE_PER_TICK);
                     let ring = (blast.scorched.max(radius * 0.9), to);
                     blast.scorched = to;
                     ring
                 });
                 let lift_to = lift_reach(blast.yield_tnt, blast.size);
-                let lift = (blast.big && blast.yield_tnt >= LIFT_YIELD && blast.lifted < lift_to)
+                let lift = (blast.big && blast.yield_tnt >= config::get().lift_yield && blast.lifted < lift_to)
                     .then(|| {
                         let from = blast.lifted.max(radius * 0.9);
                         let to = capped_ring(from, front.min(lift_to), LIFT_PER_TICK);
@@ -1538,13 +1540,13 @@ fn hold_area(cell: [i32; 3], cluster: &[[i32; 3]], mass: usize) -> Vec<[i32; 2]>
             }
         }
     }
-    let lifted = if mass as f32 >= LIFT_YIELD {
+    let lifted = if mass as f32 >= config::get().lift_yield {
         lift_reach(mass as f32, visual_size(mass as f32))
     } else {
         0.0
     };
     let reach = (crater_radius(mass as f32) * 1.7).max(lifted) + 16.0;
-    let r = ((reach / 16.0).ceil() as i32).clamp(1, HOLD_CHUNKS);
+    let r = ((reach / 16.0).ceil() as i32).clamp(1, config::get().hold_chunks);
     for dx in -r..=r {
         for dz in -r..=r {
             if dx * dx + dz * dz <= r * r {
@@ -1584,7 +1586,7 @@ fn live_fuse(host: &mut dyn ServerHost, id: u32) -> Option<i32> {
 /// a short in the TNT's data, which caps it at about 27 minutes.
 fn fuse_ticks(yield_tnt: f32) -> i32 {
     let farther = (shock_range(visual_size(yield_tnt)) - shock_range(BASE_SIZE)).max(0.0);
-    let ticks = FUSE_TICKS as f32 + farther / ESCAPE_SPEED * 20.0;
+    let ticks = FUSE_TICKS as f32 + farther / config::get().escape_speed * 20.0;
     ticks.min(f32::from(i16::MAX)).round() as i32
 }
 
@@ -1820,7 +1822,7 @@ fn digging_blasts(dimension: &str) -> Vec<([f64; 3], f64)> {
         .filter(|b| b.dimension == dimension && b.big)
         .filter_map(|b| {
             let radius = crater_radius(b.yield_tnt);
-            let lifted = if b.yield_tnt >= LIFT_YIELD { lift_reach(b.yield_tnt, b.size) } else { 0.0 };
+            let lifted = if b.yield_tnt >= config::get().lift_yield { lift_reach(b.yield_tnt, b.size) } else { 0.0 };
             (b.carved < radius * 1.1 || b.scorched < radius * 1.7 || b.lifted < lifted)
                 .then_some((b.center, (radius * 1.7).max(lifted) + 16.0))
         })
@@ -2318,7 +2320,7 @@ fn torn_off(blocks: &[Cover], base: i32, push: f64) -> Option<(i32, i32)> {
         let y = bottom + i as i32;
         match *cover {
             Cover::Air => {}
-            Cover::Breaks(kind) if push >= BREAKS_AT[usize::from(kind)] => {
+            Cover::Breaks(kind) if push >= config::get().breaks_at[usize::from(kind)] => {
                 top.get_or_insert(y);
                 low = Some(y);
                 if kind == SOIL {
