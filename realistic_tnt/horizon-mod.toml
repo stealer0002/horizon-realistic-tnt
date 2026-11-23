@@ -1,6 +1,6 @@
 id = "realistic_tnt"
 name = "Realistic TNT"
-version = "0.7.0"
+version = "0.8.0"
 description = "Explosions with a fireball, mushroom cloud, real craters and a shockwave that flattens what it sweeps over. TNT adds up with no limit."
 authors = ["stealer0002"]
 license = "MIT"

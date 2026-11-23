@@ -26,6 +26,7 @@
 //! player sees it. Particles reach 32 blocks, as vanilla's do.
 mod command;
 mod config;
+mod destruction;
 mod shader_pack;
 
 use mod_api::{
@@ -152,6 +153,10 @@ const MAX_TRAILS: usize = 28;
 const TRAIL_TICKS: u32 = 34;
 /// Whether the ground round a crater is scorched, and how many columns of it a tick.
 const SCORCH: bool = true;
+/// Whether big blasts light fires round their crater (`destruction::ignite`).
+const FIRE: bool = true;
+/// From this yield the floor of a crater melts: sand to glass, rock in the middle to obsidian.
+const GLASS_YIELD: f32 = 64.0;
 const SCORCH_PER_TICK: usize = 24;
 /// What an explosion's own push on mobs and players is multiplied by (times the cube root of the
 /// blast's yield).
@@ -207,6 +212,12 @@ struct Blast {
     scorched: f64,
     /// How far out its shockwave has torn up the land beyond the crater (`lift`).
     lifted: f64,
+    /// How far out its rim is raised and its fires lit, and how many ticks its walls have slid.
+    rimmed: f64,
+    fired: f64,
+    slumped: u32,
+    /// Where its debris will come down and dig (`destruction::Impact`).
+    impacts: Vec<destruction::Impact>,
     /// The entities its shockwave has reached.
     hit: HashSet<u32>,
     /// Whether the window's own player has been pushed by it.
@@ -587,6 +598,10 @@ impl Hooks for Mod {
             carved: 0.0,
             scorched: 0.0,
             lifted: 0.0,
+            rimmed: 0.0,
+            fired: 0.0,
+            slumped: 0,
+            impacts: Vec::new(),
             hit: HashSet::new(),
             pushed: false,
             seed,
@@ -737,6 +752,41 @@ impl Hooks for Mod {
                         (from, to)
                     })
                     .filter(|(from, to)| to > from);
+                // The rim rises behind the digging, out to where its blanket thins to nothing.
+                let dug = if blast.carved >= radius * 1.1 { f64::INFINITY } else { blast.carved };
+                let rim_to = radius * destruction::RIM_REACH;
+                let rim = (blast.big && blast.rimmed < rim_to)
+                    .then(|| {
+                        let from = blast.rimmed.max(radius * 0.95);
+                        let to = capped_ring(from, front.min(dug).min(rim_to), CARVE_PER_TICK);
+                        blast.rimmed = to;
+                        (from, to)
+                    })
+                    .filter(|(from, to)| to > from);
+                let fire_to = destruction::fire_reach(blast.yield_tnt, blast.size);
+                let fire = (config::get().fire
+                    && blast.big
+                    && blast.yield_tnt >= destruction::FIRE_YIELD
+                    && blast.fired < fire_to)
+                    .then(|| {
+                        let from = blast.fired.max(radius * 0.9);
+                        let to = capped_ring(from, front.min(fire_to), CARVE_PER_TICK);
+                        blast.fired = to;
+                        (from, to)
+                    })
+                    .filter(|(from, to)| to > from);
+                // Once it is dug, its walls slide in for a while.
+                let slump = blast.big
+                    && dug.is_infinite()
+                    && radius >= 6.0
+                    && blast.slumped < destruction::slump_ticks(radius);
+                if slump {
+                    blast.slumped += 1;
+                }
+                let now = blast.ticks;
+                let (due, waiting): (Vec<_>, Vec<_>) =
+                    std::mem::take(&mut blast.impacts).into_iter().partition(|i| i.due <= now);
+                blast.impacts = waiting;
                 let range = f64::from(shock_range(blast.size));
                 let shock = (front - speed / 20.0 < range).then(|| (front.min(range), blast.hit.clone()));
                 work.push(Work {
@@ -753,6 +803,11 @@ impl Hooks for Mod {
                     carve,
                     scorch_ring,
                     lift,
+                    rim,
+                    fire,
+                    slump,
+                    due,
+                    impacts: Vec::new(),
                     shock,
                 });
             }
@@ -772,15 +827,27 @@ impl Hooks for Mod {
             job.trails = smoke_trails(host, level, std::mem::take(&mut job.trails));
             scorch(host, level, job);
             if let Some((from, to)) = job.carve {
-                ejecta(host, level, &dimension, job, from, to);
+                let thrown = ejecta(host, level, &dimension, job, from, to);
+                job.impacts.extend(thrown);
                 carve(host, &dimension, job, from, to);
             }
             if let Some((from, to)) = job.scorch_ring {
                 scorch_ring(host, &dimension, job, from, to);
             }
-            if let Some((from, to)) = job.lift {
-                lift(host, level, &viewers, &dimension, job, from, to);
+            if let Some((from, to)) = job.rim {
+                destruction::rim(host, &dimension, job, from, to);
             }
+            if job.slump {
+                destruction::slump(host, level, &dimension, job, job.ticks);
+            }
+            if let Some((from, to)) = job.lift {
+                let thrown = lift(host, level, &viewers, &dimension, job, from, to);
+                job.impacts.extend(thrown);
+            }
+            if let Some((from, to)) = job.fire {
+                destruction::ignite(host, level, &dimension, job, from, to);
+            }
+            destruction::impacts(host, level, &dimension, &job.due);
         }
         // The shockwave reaches what is in its way: it hurts and throws it.
         let mut struck: Vec<(u64, Vec<u32>)> = Vec::new();
@@ -796,6 +863,8 @@ impl Hooks for Mod {
                 let mut trails = job.trails;
                 trails.append(&mut blast.trails);
                 blast.trails = trails;
+                let room = destruction::MAX_IMPACTS.saturating_sub(blast.impacts.len());
+                blast.impacts.extend(job.impacts.into_iter().take(room));
             }
         }
         for (id, ids) in struck {
@@ -977,6 +1046,14 @@ struct Work {
     scorch_ring: Option<(f64, f64)>,
     /// The ring of land beyond the crater whose shockwave tears it up this tick (`lift`).
     lift: Option<(f64, f64)>,
+    /// The ring of rim to raise and the ring of land to set alight this tick.
+    rim: Option<(f64, f64)>,
+    fire: Option<(f64, f64)>,
+    /// Whether the crater's walls slide in this tick.
+    slump: bool,
+    /// The debris coming down this tick, and that thrown this tick (handed back to the blast).
+    due: Vec<destruction::Impact>,
+    impacts: Vec<destruction::Impact>,
     /// How far the shockwave's front has run, and what it has already reached; none once it is
     /// past its reach.
     shock: Option<(f64, HashSet<u32>)>,
@@ -2041,14 +2118,24 @@ fn crater_floor(dimension: &str) -> i32 {
 }
 
 /// Digs one ring of a big blast's crater, straight into the chunks: the column empties, and its
-/// new floor chars (soil to coarse dirt, stone to blackstone, molten rock near the middle).
+/// new floor chars (soil to coarse dirt, stone to blackstone, molten rock near the middle). Under a
+/// blast of `GLASS_YIELD` TNT or more, the floor near the middle melts to a crust of glass (as
+/// trinitite did) and some of the rock in the middle to obsidian.
 fn carve(host: &mut dyn ServerHost, dimension: &str, job: &Work, from: f64, to: f64) {
     let radius = crater_radius(job.yield_tnt);
     let floor = crater_floor(dimension);
-    let palette = ["minecraft:air", "minecraft:coarse_dirt", "minecraft:blackstone", "minecraft:magma_block"];
+    let palette = [
+        "minecraft:air",
+        "minecraft:coarse_dirt",
+        "minecraft:blackstone",
+        "minecraft:magma_block",
+        "minecraft:glass",
+        "minecraft:green_stained_glass",
+        "minecraft:obsidian",
+    ];
     let (Some(palette), Some(filters)) = (
         states_of(&*host, &palette),
-        tag_filters(&*host, &["minecraft:dirt", "minecraft:base_stone_overworld"]),
+        tag_filters(&*host, &["minecraft:dirt", "minecraft:base_stone_overworld", "minecraft:sand"]),
     ) else {
         return;
     };
@@ -2073,6 +2160,22 @@ fn carve(host: &mut dyn ServerHost, dimension: &str, job: &Work, from: f64, to: 
             block: 0,
             only: None,
         });
+        let fused = job.yield_tnt >= GLASS_YIELD;
+        // A crust of glass, greenish in patches, before the floor chars.
+        let glaze = unit(mix([x, 10, z], job.id), 0);
+        if fused && r < radius * 0.6 && glaze < 0.55 {
+            for only in 0..3 {
+                edit.runs.push(BlockRun {
+                    x,
+                    z,
+                    y: low - 1,
+                    height: 1,
+                    surface: None,
+                    block: if glaze < 0.2 { 5 } else { 4 },
+                    only: Some(only),
+                });
+            }
+        }
         edit.runs.push(BlockRun {
             x,
             z,
@@ -2082,16 +2185,36 @@ fn carve(host: &mut dyn ServerHost, dimension: &str, job: &Work, from: f64, to: 
             block: 1,
             only: Some(0),
         });
-        let molten = r < radius * 0.3 && unit(mix([x, 8, z], job.id), 0) < 0.3;
+        let melt = unit(mix([x, 8, z], job.id), 0);
+        let molten = r < radius * 0.3 && melt < 0.3;
+        let obsidian = fused && r < radius * 0.3 && (0.3..0.5).contains(&melt);
         edit.runs.push(BlockRun {
             x,
             z,
             y: low - 1,
             height: 1,
             surface: None,
-            block: if molten { 3 } else { 2 },
+            block: if molten {
+                3
+            } else if obsidian {
+                6
+            } else {
+                2
+            },
             only: Some(1),
         });
+        // Sand under it melts too.
+        if fused && r < radius * 0.8 {
+            edit.runs.push(BlockRun {
+                x,
+                z,
+                y: low - 3,
+                height: 2,
+                surface: None,
+                block: 4,
+                only: Some(2),
+            });
+        }
     }
     if !edit.runs.is_empty()
         && let Err(error) = host.edit_blocks(dimension, &edit)
@@ -2143,10 +2266,18 @@ fn scorch_ring(host: &mut dyn ServerHost, dimension: &str, job: &Work, from: f64
 
 /// Throws some of what a big blast's ring is about to dig out: blocks of the ground, flung up and
 /// away, harder the bigger the blast. (Horizon keeps at most 1024 falling blocks in a level.)
-fn ejecta(host: &mut dyn ServerHost, level: LevelRef, dimension: &str, job: &Work, from: f64, to: f64) {
+fn ejecta(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    dimension: &str,
+    job: &Work,
+    from: f64,
+    to: f64,
+) -> Vec<destruction::Impact> {
+    let mut impacts = Vec::new();
     let columns = ring_columns(job.center, from, to);
     if columns.is_empty() {
-        return;
+        return impacts;
     }
     let step = (columns.len() / EJECTA_PER_TICK).max(1);
     let ground = job.base[1].floor() as i32 - 1;
@@ -2164,7 +2295,11 @@ fn ejecta(host: &mut dyn ServerHost, level: LevelRef, dimension: &str, job: &Wor
         let out = throw(job.center, from_pos, 0.7 * strength * (0.7 + 0.6 * unit(seed, 1)));
         let velocity = [out[0], out[1] + 0.4 + 0.5 * unit(seed, 2), out[2]].map(|v| v.clamp(-3.9, 3.9));
         let falling = falling(false, true);
-        host.spawn_falling_block(dimension, state, from_pos, velocity, falling);
+        if host.spawn_falling_block(dimension, state, from_pos, velocity, falling)
+            && let Some(impact) = destruction::predict(from_pos, velocity, job.base[1], job.ticks, job)
+        {
+            impacts.push(impact);
+        }
         if i % 3 == 0 {
             emit(
                 host,
@@ -2173,16 +2308,23 @@ fn ejecta(host: &mut dyn ServerHost, level: LevelRef, dimension: &str, job: &Wor
             );
         }
     }
+    impacts
 }
 
 /// How far out the shockwave of a blast of `yield_tnt` and `size` tears up the land (`lift`): where
 /// it still pushes `LIFT_PUSH` blocks a tick (`shock_effect`).
 fn lift_reach(yield_tnt: f32, size: f32) -> f64 {
+    push_reach(yield_tnt, size, LIFT_PUSH)
+}
+
+/// How far out the shockwave of a blast of `yield_tnt` and `size` still pushes `push` blocks a
+/// tick (`shock_effect`), or 0 when it never does.
+fn push_reach(yield_tnt: f32, size: f32, push: f64) -> f64 {
     let most = SHOCK_PUSH * (1.0 + 0.35 * f64::from(yield_tnt.max(1.0)).ln());
-    if most <= LIFT_PUSH {
+    if most <= push {
         return 0.0;
     }
-    f64::from(shock_range(size)) * (1.0 - (LIFT_PUSH / most).sqrt())
+    f64::from(shock_range(size)) * (1.0 - (push / most).sqrt())
 }
 
 /// What a block is to the shockwave sweeping over it (`lift`).
@@ -2360,10 +2502,11 @@ fn lift(
     job: &Work,
     from: f64,
     to: f64,
-) {
+) -> Vec<destruction::Impact> {
+    let mut impacts = Vec::new();
     let columns = ring_columns(job.center, from, to);
     if columns.is_empty() {
-        return;
+        return impacts;
     }
     let read_at: Vec<(i32, i32)> = columns.iter().map(|&[x, z]| (x, z)).collect();
     let Ok(read) = host.read_columns(
@@ -2372,11 +2515,11 @@ fn lift(
         Heightmap::WorldSurface,
         (LIFT_DEPTH, 0),
     ) else {
-        return;
+        return impacts;
     };
     let depth = LIFT_DEPTH as usize;
     if read.blocks.len() < columns.len() * depth || read.bases.len() < columns.len() {
-        return;
+        return impacts;
     }
     let names: Vec<String> = read.palette.iter().map(|&state| name_of(&*host, state)).collect();
     let covers: Vec<Cover> = names.iter().map(|name| cover_of(name)).collect();
@@ -2396,7 +2539,7 @@ fn lift(
             .fold(f64::INFINITY, f64::min)
     };
     let Some(air) = state_of(&*host, "minecraft:air") else {
-        return;
+        return impacts;
     };
     let mut edit = BlockEdit {
         palette: vec![air],
@@ -2461,7 +2604,7 @@ fn lift(
         }
     }
     if edit.runs.is_empty() {
-        return;
+        return impacts;
     }
     if let Err(error) = host.edit_blocks(dimension, &edit) {
         eprintln!("[realistic_tnt] lift: block edit failed in {dimension}: {error}");
@@ -2494,6 +2637,12 @@ fn lift(
             if host.spawn_falling_block(dimension, state, at, velocity, falling) {
                 thrown += 1;
                 refused = 0;
+                // Every other block that flies far digs where it comes down.
+                if thrown % 2 == 0
+                    && let Some(impact) = destruction::predict(at, velocity, job.base[1], job.ticks, job)
+                {
+                    impacts.push(impact);
+                }
             } else {
                 // The level holds all the falling blocks it will (or the chunk is gone).
                 refused += 1;
@@ -2506,6 +2655,7 @@ fn lift(
             puffs += 1;
         }
     }
+    impacts
 }
 
 /// How far column (`x`, `z`)'s centre is from `center`, across the ground.
@@ -2915,6 +3065,10 @@ mod tests {
             carved: 0.0,
             scorched: 0.0,
             lifted: 0.0,
+            rimmed: 0.0,
+            fired: 0.0,
+            slumped: 0,
+            impacts: Vec::new(),
             hit: HashSet::new(),
             pushed: false,
             seed: 0.0,

@@ -10,6 +10,7 @@ pub(super) struct Tuning {
     pub lift_yield: f32,
     pub breaks_at: [f64; 4],
     pub scorch: bool,
+    pub fire: bool,
     pub knockback: f64,
 }
 
@@ -20,6 +21,7 @@ const DEFAULTS: Tuning = Tuning {
     lift_yield: super::LIFT_YIELD,
     breaks_at: super::BREAKS_AT,
     scorch: super::SCORCH,
+    fire: super::FIRE,
     knockback: super::KNOCKBACK,
 };
 
@@ -111,6 +113,7 @@ fn apply(config: &mut Tuning, key: &str, value: &str) -> bool {
             true
         }
         "SCORCH" => set(&mut config.scorch, value, |_| true),
+        "FIRE" => set(&mut config.fire, value, |_| true),
         "KNOCKBACK" => set(&mut config.knockback, value, |n| n.is_finite() && n >= 0.0),
         _ => false,
     }
@@ -135,7 +138,7 @@ mod tests {
     fn config_accepts_all_overrides() {
         let config = parse(
             "ESCAPE_SPEED = 20 # blocks/s\nMAX_FOLD = 900\nHOLD_CHUNKS = 8\n\
-             LIFT_YIELD = 32\nBREAKS_AT = 1, 2, 3, 4\nSCORCH = false\nKNOCKBACK = 0",
+             LIFT_YIELD = 32\nBREAKS_AT = 1, 2, 3, 4\nSCORCH = false\nFIRE = false\nKNOCKBACK = 0",
         );
         assert_eq!(config.escape_speed, 20.0);
         assert_eq!(config.max_fold, 900);
@@ -143,6 +146,7 @@ mod tests {
         assert_eq!(config.lift_yield, 32.0);
         assert_eq!(config.breaks_at, [1.0, 2.0, 3.0, 4.0]);
         assert!(!config.scorch);
+        assert!(!config.fire);
         assert_eq!(config.knockback, 0.0);
     }
 

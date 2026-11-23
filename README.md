@@ -79,6 +79,11 @@ TNT, creepers, beds, end crystals: every explosion gets all of this.
 | Knockback | The explosion's own push is 35% harder, times the cube root of the yield. | no |
 | Crater | A blast of more than one TNT digs its own crater, ring by ring as its front passes: a bowl, everything above it cut away, a charred floor (blackstone, coarse dirt, magma near the middle), the land round it scorched, blocks flung out of it. | no |
 | Land torn up | A blast of 64 TNT or more knocks down what its shockwave sweeps over beyond the crater, by how hard it still pushes there: glass, leaves, plants, wool and torches first, then wood (trees, wooden houses, doors, fences), then the turf, then brick, cut stone, cobblestone and concrete. As much of it as the game allows flies up and away where players can see it. Natural rock, ores, metal and blocks holding things (chests, signs, beds) stay. | no |
+| Crater rim | The ground the crater throws out piles round it: a raised rim about a seventh of the crater's radius high at its crest, thinning out to almost twice its radius. | no |
+| Walls slide in | Once a crater of 6 blocks or more is dug, its steep walls keep breaking off and sliding into it for a few seconds (up to half a minute for the biggest). | no |
+| Fires | A blast of 16 TNT or more sets the land round its crater alight, out past where its shockwave knocks the trees down (at least 2.5 times the crater's radius), so the forest still standing catches; the game's fire spreads it from there (`FIRE`). | no |
+| Debris craters | Ground the blast throws far comes down hard and digs a small crater of its own where it lands, with a puff of dust. | no |
+| Glass and molten rock | Under a blast of 64 TNT or more, the middle of the crater's floor melts to a crust of glass (some of it green, as trinitite), sand under it to glass, and some of the rock in its middle to obsidian. | no |
 
 ## Lighting a big mass
 
@@ -156,6 +161,7 @@ HOLD_CHUNKS = 16
 LIFT_YIELD = 64
 BREAKS_AT = 0.5, 0.8, 1.5, 2.0
 SCORCH = true
+FIRE = true
 KNOCKBACK = 1.35
 ```
 
@@ -167,6 +173,7 @@ KNOCKBACK = 1.35
 | `LIFT_YIELD` | Positive finite number | Minimum TNT yield that tears up land beyond the crater. |
 | `BREAKS_AT` | Four finite, nonnegative numbers in strictly increasing order | Shockwave push, in blocks per tick, needed to knock down glass and plants, wood, turf, then brick and stone. |
 | `SCORCH` | `true` or `false` | Whether explosions scorch the surrounding land. |
+| `FIRE` | `true` or `false` | Whether blasts of 16 TNT or more set fires round their crater, which then spread as fire does. |
 | `KNOCKBACK` | Finite, nonnegative number | Multiplier for the explosion's initial knockback. |
 
 ## Limits
