@@ -155,7 +155,7 @@ const TRAIL_TICKS: u32 = 34;
 const SCORCH: bool = true;
 /// Whether big blasts light fires round their crater (`destruction::ignite`).
 const FIRE: bool = true;
-/// From this yield the floor of a crater melts: sand to glass, rock in the middle to obsidian.
+/// From this yield some of the molten rock in the middle of a crater cools to obsidian.
 const GLASS_YIELD: f32 = 64.0;
 const SCORCH_PER_TICK: usize = 24;
 /// What an explosion's own push on mobs and players is multiplied by (times the cube root of the
@@ -530,7 +530,10 @@ impl Hooks for Mod {
                     continue;
                 }
                 let name = block_at(&*host, level, pos);
-                let Some(state) = is_debris(&name).then(|| state_of(&*host, &name)).flatten() else {
+                // A big blast's fireball bakes what it throws (`destruction::baked`); a lone TNT's
+                // flies as it was.
+                let thrown_as = if big { destruction::baked(&name) } else { Some(name.clone()) };
+                let Some(state) = thrown_as.filter(|_| is_debris(&name)).and_then(|n| state_of(&*host, &n)) else {
                     kept.push(pos);
                     continue;
                 };
@@ -2117,25 +2120,17 @@ fn crater_floor(dimension: &str) -> i32 {
     }
 }
 
-/// Digs one ring of a big blast's crater, straight into the chunks: the column empties, and its
-/// new floor chars (soil to coarse dirt, stone to blackstone, molten rock near the middle). Under a
-/// blast of `GLASS_YIELD` TNT or more, the floor near the middle melts to a crust of glass (as
-/// trinitite did) and some of the rock in the middle to obsidian.
+/// Digs one ring of a big blast's crater, straight into the chunks: the column empties, and the
+/// heat bakes the bowl it leaves two blocks deep (`destruction::Heat`: sand to glass, stone to
+/// blackstone, soil to coarse dirt, clay to terracotta...). Rock in the middle melts to magma, and
+/// under a blast of `GLASS_YIELD` TNT or more some of it to obsidian.
 fn carve(host: &mut dyn ServerHost, dimension: &str, job: &Work, from: f64, to: f64) {
     let radius = crater_radius(job.yield_tnt);
     let floor = crater_floor(dimension);
-    let palette = [
-        "minecraft:air",
-        "minecraft:coarse_dirt",
-        "minecraft:blackstone",
-        "minecraft:magma_block",
-        "minecraft:glass",
-        "minecraft:green_stained_glass",
-        "minecraft:obsidian",
-    ];
-    let (Some(palette), Some(filters)) = (
-        states_of(&*host, &palette),
-        tag_filters(&*host, &["minecraft:dirt", "minecraft:base_stone_overworld", "minecraft:sand"]),
+    let (Some(palette), Some(filters), Some(mut heat)) = (
+        states_of(&*host, &["minecraft:air", "minecraft:magma_block", "minecraft:obsidian"]),
+        tag_filters(&*host, &["minecraft:base_stone_overworld"]),
+        destruction::Heat::new(&*host),
     ) else {
         return;
     };
@@ -2144,6 +2139,7 @@ fn carve(host: &mut dyn ServerHost, dimension: &str, job: &Work, from: f64, to: 
         filters,
         ..Default::default()
     };
+    let fused = job.yield_tnt >= GLASS_YIELD;
     for [x, z] in ring_columns(job.center, from, to) {
         let r = column_distance(job.center, x, z);
         let rough = unit(mix([x, 7, z], job.id), 0);
@@ -2160,67 +2156,35 @@ fn carve(host: &mut dyn ServerHost, dimension: &str, job: &Work, from: f64, to: 
             block: 0,
             only: None,
         });
-        let fused = job.yield_tnt >= GLASS_YIELD;
-        // A crust of glass, greenish in patches, before the floor chars.
-        let glaze = unit(mix([x, 10, z], job.id), 0);
-        if fused && r < radius * 0.6 && glaze < 0.55 {
-            for only in 0..3 {
-                edit.runs.push(BlockRun {
-                    x,
-                    z,
-                    y: low - 1,
-                    height: 1,
-                    surface: None,
-                    block: if glaze < 0.2 { 5 } else { 4 },
-                    only: Some(only),
-                });
-            }
-        }
-        edit.runs.push(BlockRun {
-            x,
-            z,
-            y: low - 1,
-            height: 1,
-            surface: None,
-            block: 1,
-            only: Some(0),
-        });
         let melt = unit(mix([x, 8, z], job.id), 0);
-        let molten = r < radius * 0.3 && melt < 0.3;
-        let obsidian = fused && r < radius * 0.3 && (0.3..0.5).contains(&melt);
-        edit.runs.push(BlockRun {
-            x,
-            z,
-            y: low - 1,
-            height: 1,
-            surface: None,
-            block: if molten {
-                3
-            } else if obsidian {
-                6
-            } else {
-                2
-            },
-            only: Some(1),
-        });
-        // Sand under it melts too.
-        if fused && r < radius * 0.8 {
+        let core = if r >= radius * 0.3 {
+            None
+        } else if melt < 0.3 {
+            Some(1)
+        } else if fused && melt < 0.5 {
+            Some(2)
+        } else {
+            None
+        };
+        if let Some(block) = core {
             edit.runs.push(BlockRun {
                 x,
                 z,
-                y: low - 3,
-                height: 2,
+                y: low - 1,
+                height: 1,
                 surface: None,
-                block: 4,
-                only: Some(2),
+                block,
+                only: Some(0),
             });
         }
+        heat.bake(x, z, low - 2, 2);
     }
     if !edit.runs.is_empty()
         && let Err(error) = host.edit_blocks(dimension, &edit)
     {
         eprintln!("[realistic_tnt] carve: block edit failed in {dimension}: {error}");
     }
+    heat.apply(host, dimension);
 }
 
 /// Scorches one ring of land round a big blast's crater: plants burn away and soil chars, less of
@@ -2287,7 +2251,9 @@ fn ejecta(
         if !is_debris(&name) {
             continue;
         }
-        let Some(state) = state_of(&*host, &name) else {
+        // It comes out of the fireball baked (`destruction::baked`): sand as glass, stone as
+        // blackstone; leaves and snow are gone.
+        let Some(state) = destruction::baked(&name).and_then(|name| state_of(&*host, &name)) else {
             continue;
         };
         let seed = mix([x, ground, z], job.id);

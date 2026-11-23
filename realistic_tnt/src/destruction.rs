@@ -5,7 +5,7 @@ use super::{
     Particle, Puff, Trail, Work, block_at, column_distance, crater_radius, emit, falling, is_debris, mix,
     ring_columns, state_of, states_of, tag_filters, unit,
 };
-use mod_api::{BlockEdit, BlockRun, Heightmap, LevelRef, ServerHost};
+use mod_api::{BlockEdit, BlockRun, Heightmap, HostBlockStates, LevelRef, ServerHost};
 
 /// The rim stands about this much of the crater's radius high at its crest, and the blanket of
 /// thrown-out ground thins with the cube of the distance past it, out to `RIM_REACH` radii.
@@ -192,7 +192,8 @@ pub(super) fn slump(host: &mut dyn ServerHost, level: LevelRef, dimension: &str,
             if !is_debris(&name) {
                 break;
             }
-            let Some(state) = state_of(&*host, &name) else {
+            // The wall was baked with the bowl: it slides in as it was baked.
+            let Some(state) = baked(&name).and_then(|name| state_of(&*host, &name)) else {
                 break;
             };
             if !super::set_block(host, level, [x, y, z], air) {
@@ -242,6 +243,118 @@ pub(super) fn ignite(host: &mut dyn ServerHost, level: LevelRef, dimension: &str
         }
     }
     debug(format_args!("ignite {from:.0}..{to:.0}: {} tried, {lit} lit", columns.len()));
+}
+
+/// What the heat of a blast turns each material into, `#` naming a block tag. In this order: a
+/// result is never turned again by a later row (tuff from gravel comes after the stone row).
+const HEAT: &[(&str, &str)] = &[
+    ("#minecraft:sand", "minecraft:glass"),
+    ("minecraft:sandstone", "minecraft:glass"),
+    ("minecraft:red_sandstone", "minecraft:glass"),
+    ("#minecraft:base_stone_overworld", "minecraft:blackstone"),
+    ("minecraft:cobblestone", "minecraft:blackstone"),
+    ("minecraft:mossy_cobblestone", "minecraft:blackstone"),
+    ("minecraft:cobbled_deepslate", "minecraft:blackstone"),
+    ("minecraft:stone_bricks", "minecraft:cracked_stone_bricks"),
+    ("#minecraft:dirt", "minecraft:coarse_dirt"),
+    ("minecraft:clay", "minecraft:terracotta"),
+    ("minecraft:mud", "minecraft:packed_mud"),
+    ("minecraft:gravel", "minecraft:tuff"),
+    ("#minecraft:snow", "minecraft:air"),
+    ("#minecraft:ice", "minecraft:air"),
+    ("#minecraft:leaves", "minecraft:air"),
+    ("minecraft:netherrack", "minecraft:magma_block"),
+];
+
+/// What a block named `name` (`minecraft:sand`) becomes in the heat, by name, for the ground the
+/// crater throws out and its walls shed: as `HEAT` bakes the ground, `None` where it is gone (snow,
+/// ice, leaves), and the block itself where the heat leaves it be.
+pub(super) fn baked(name: &str) -> Option<String> {
+    let bare = name.strip_prefix("minecraft:").unwrap_or(name);
+    let into = match bare {
+        "sand" | "red_sand" | "suspicious_sand" | "sandstone" | "red_sandstone" => "glass",
+        "stone" | "granite" | "diorite" | "andesite" | "tuff" | "deepslate" | "calcite" | "cobblestone"
+        | "mossy_cobblestone" | "cobbled_deepslate" => "blackstone",
+        "stone_bricks" => "cracked_stone_bricks",
+        "dirt" | "grass_block" | "podzol" | "mycelium" | "rooted_dirt" | "coarse_dirt" | "moss_block" => {
+            "coarse_dirt"
+        }
+        "clay" => "terracotta",
+        "mud" => "packed_mud",
+        "gravel" => "tuff",
+        "netherrack" => "magma_block",
+        "snow" | "snow_block" | "powder_snow" | "ice" | "packed_ice" | "blue_ice" => return None,
+        _ if bare.ends_with("_leaves") => return None,
+        _ => return Some(name.to_owned()),
+    };
+    Some(format!("minecraft:{into}"))
+}
+
+/// A bulk edit that bakes ground in the heat of a blast (`HEAT`): sand to glass, stone to
+/// blackstone, soil to coarse dirt, clay to terracotta, snow and ice to steam.
+pub(super) struct Heat {
+    edit: BlockEdit,
+    /// (filter, palette entry) of each row of `HEAT` this game has.
+    turns: Vec<(u32, u32)>,
+}
+
+impl Heat {
+    pub(super) fn new(host: &dyn mod_api::Host) -> Option<Self> {
+        let states = host.block_states();
+        let mut edit = BlockEdit::default();
+        let mut turns = Vec::new();
+        for &(what, into) in HEAT {
+            let filter = match what.strip_prefix('#') {
+                Some(tag) => {
+                    let id = mod_api::Identifier::parse(tag).ok()?;
+                    let key = host.tags().key(&id)?;
+                    mod_api::StatePredicate::tag(&states, host.tags(), key, &[]).ok()
+                }
+                None => host
+                    .block_key(what)
+                    .and_then(|key| mod_api::StatePredicate::block(&states, key, &[]).ok()),
+            };
+            // A block this game doesn't have is skipped; so is a row whose result it doesn't have.
+            let (Some(filter), Some(state)) = (filter, state_of(host, into)) else {
+                continue;
+            };
+            let block = match edit.palette.iter().position(|&s| s == state) {
+                Some(i) => i as u32,
+                None => {
+                    edit.palette.push(state);
+                    edit.palette.len() as u32 - 1
+                }
+            };
+            edit.filters.push(filter);
+            turns.push((edit.filters.len() as u32 - 1, block));
+        }
+        Some(Self { edit, turns })
+    }
+
+    /// Bakes `height` blocks of column (`x`, `z`) up from `y`.
+    pub(super) fn bake(&mut self, x: i32, z: i32, y: i32, height: u32) {
+        for &(only, block) in &self.turns {
+            self.edit.runs.push(BlockRun {
+                x,
+                z,
+                y,
+                height,
+                surface: None,
+                block,
+                only: Some(only),
+            });
+        }
+    }
+
+    pub(super) fn apply(self, host: &mut dyn ServerHost, dimension: &str) {
+        if self.edit.runs.is_empty() {
+            return;
+        }
+        match host.edit_blocks(dimension, &self.edit) {
+            Ok(changed) => debug(format_args!("heat: {changed} blocks baked")),
+            Err(error) => eprintln!("[realistic_tnt] heat: block edit failed in {dimension}: {error}"),
+        }
+    }
 }
 
 /// How far out a blast of `yield_tnt` and `size` lights fires: 2.5 crater radii, or a third past
@@ -374,6 +487,25 @@ mod tests {
         for name in ["minecraft:grass_block", "minecraft:stone", "minecraft:dirt", "minecraft:gravel"] {
             assert!(!stands_on_ground(name), "{name}");
         }
+    }
+
+    #[test]
+    fn no_heat_result_is_turned_again_by_a_later_row() {
+        // Each result, by name, must not be an input of a row after its own (tags aside, which
+        // the game checks: blackstone, glass and the rest are in none of the tags used).
+        for (i, &(_, into)) in HEAT.iter().enumerate() {
+            assert!(HEAT[i + 1..].iter().all(|&(what, _)| what != into), "{into}");
+        }
+    }
+
+    #[test]
+    fn the_heat_bakes_thrown_ground_as_it_bakes_the_bowl() {
+        assert_eq!(baked("minecraft:sand").as_deref(), Some("minecraft:glass"));
+        assert_eq!(baked("minecraft:stone").as_deref(), Some("minecraft:blackstone"));
+        assert_eq!(baked("minecraft:grass_block").as_deref(), Some("minecraft:coarse_dirt"));
+        assert_eq!(baked("minecraft:clay").as_deref(), Some("minecraft:terracotta"));
+        assert_eq!(baked("minecraft:oak_leaves"), None);
+        assert_eq!(baked("minecraft:oak_log").as_deref(), Some("minecraft:oak_log"));
     }
 
     #[test]

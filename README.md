@@ -83,7 +83,7 @@ TNT, creepers, beds, end crystals: every explosion gets all of this.
 | Walls slide in | Once a crater of 6 blocks or more is dug, its steep walls keep breaking off and sliding into it for a few seconds (up to half a minute for the biggest). | no |
 | Fires | A blast of 16 TNT or more sets the land round its crater alight, out past where its shockwave knocks the trees down (at least 2.5 times the crater's radius), so the forest still standing catches; the game's fire spreads it from there (`FIRE`). | no |
 | Debris craters | Ground the blast throws far comes down hard and digs a small crater of its own where it lands, with a puff of dust. | no |
-| Glass and molten rock | Under a blast of 64 TNT or more, the middle of the crater's floor melts to a crust of glass (some of it green, as trinitite), sand under it to glass, and some of the rock in its middle to obsidian. | no |
+| Baked ground | The heat bakes the crater's whole bowl two blocks deep, each material as it would: sand and sandstone to glass, stone, cobblestone and deepslate to blackstone, stone bricks crack, soil to coarse dirt, clay to terracotta, mud dries, gravel fuses to tuff, snow, ice and leaves go, netherrack glows to magma. What the crater throws out and its walls shed comes down baked the same way. Rock in the middle melts to magma, and under 64 TNT or more some of it to obsidian. | no |
 
 ## Lighting a big mass
 
