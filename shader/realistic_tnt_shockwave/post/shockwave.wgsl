@@ -181,12 +181,19 @@ fn tnt_shape(q: vec3<f32>, b: TntBlast, cl: TntCloud, octaves: i32) -> vec3<f32>
     // turn over the crown, and descend at the outer edge.
     let turned = vec2<f32>(dot(tube, vec2<f32>(cl.roll.x, -cl.roll.y)), dot(tube, cl.roll.yx));
     let unit = q.xz / max(rr, 0.001 * b.s);
-    let weight = cl.vortex * tnt_fall(1.0, 1.65, torus) * smoothstep(0.03, 0.2, rr / cl.rc);
+    // Half the roll: a full turn drags the billows into streaks.
+    let weight = 0.5 * cl.vortex * tnt_fall(1.0, 1.65, torus) * smoothstep(0.03, 0.2, rr / cl.rc);
     let shift = (turned - tube) * weight;
-    let sample_pos = q + vec3<f32>(unit.x * shift.x, shift.y, unit.y * shift.x);
+    var sample_pos = q + vec3<f32>(unit.x * shift.x, shift.y, unit.y * shift.x);
+    // A slow warp of the noise, so the billows are lumps of different sizes, not a grid of blobs.
+    let warp = tnt_noise(q * (0.9 / b.s) + vec3<f32>(b.seed * 4.1, -b.t * 0.2, 1.7)) - 0.5;
+    sample_pos = sample_pos + vec3<f32>(warp, -warp * 0.5, warp) * (b.s * 0.35);
     let n = tnt_fbm(sample_pos * (2.0 / b.s) + vec3<f32>(b.seed * 7.3, -b.t * 0.55, b.seed * 3.1), octaves);
-    let puff = (n - 0.5) * 1.4;
-    let cap = tnt_fall(0.8, 1.0, e + puff);
+    // Billows: rounded tops where the noise peaks, as cumulus has.
+    let billow = 1.0 - abs(2.0 * n - 1.0);
+    let puff = (mix(n, billow, 0.45) - 0.5) * 1.4;
+    // A soft edge that frays into the air, thicker inside.
+    let cap = tnt_fall(0.55, 1.05, e + puff) * (0.6 + 0.6 * n);
     // The stem under it, wide and ragged.
     let span = smoothstep(-0.4, 0.5, q.y) * tnt_fall(cl.yc - cl.rc * 0.4, cl.yc + cl.rc * 0.1, q.y);
     let stem = tnt_fall(cl.rs * 0.8, cl.rs * 1.4, rr + puff * cl.rs * 1.8) * span * 0.8;
@@ -197,9 +204,12 @@ fn tnt_shape(q: vec3<f32>, b: TntBlast, cl: TntCloud, octaves: i32) -> vec3<f32>
     let density = max(max(cap, stem), low);
     // The middle of the cap is the hottest. As it cools the fire breaks up into patches that
     // glow through the smoke for a moment.
+    // Fire lives on real seconds (a little longer for a bigger blast), not on the slow clock the
+    // cloud rolls on: a big cloud burns out into black smoke instead of staying orange.
+    let burn = mix(b.t, b.age, 0.65);
     let heart = tnt_fall(0.1, 1.05, e + puff * 0.7);
-    let patches = smoothstep(b.t * 0.22 - 0.1, b.t * 0.22 + 0.3, n);
-    let heat = (heart * 2.4 * exp(-b.t / 1.15) * patches + stem * exp(-b.t / 0.9) + low * 1.4 * exp(-b.t / 0.6))
+    let patches = smoothstep(burn * 0.22 - 0.1, burn * 0.22 + 0.3, n);
+    let heat = (heart * 2.4 * exp(-burn / 1.15) * patches + stem * exp(-burn / 0.9) + low * 1.4 * exp(-burn / 0.6))
         * (0.5 + n);
     return vec3<f32>(density, heat, n);
 }
@@ -236,7 +246,7 @@ fn tnt_march(dir: vec3<f32>, max_dist: f32, b: TntBlast, jitter: f32) -> vec4<f3
     if t1 <= t0 {
         return vec4<f32>(0.0);
     }
-    let count = 16 + 10 * i32(tnt_detail);
+    let count = 20 + 12 * i32(tnt_detail);
     let dt = (t1 - t0) / f32(count);
     // It thins as it spreads, and goes at the end of its life.
     let sigma = 1.5 / (1.0 + b.t * 0.3) * tnt_fall(TNT_LIFE * 0.45, TNT_LIFE, b.t);
@@ -265,7 +275,7 @@ fn tnt_march(dir: vec3<f32>, max_dist: f32, b: TntBlast, jitter: f32) -> vec4<f3
             let under = tnt_fall(-0.4, 0.22, (q.y - cl.yc) / cl.rc);
             let below = under / (1.0 + dot(q.xz, q.xz) / (cl.rc * cl.rc));
             let c = soot * (sky + sun * lit) * (0.75 + 0.5 * shape.z)
-                + vec3<f32>(1.0, 0.91, 0.71) * rim * 0.85
+                + vec3<f32>(1.0, 0.91, 0.71) * rim * 0.4
                 + embers * below + tnt_fire(shape.y) * 2.2;
             colour = colour + trans * a * c;
             trans = trans * (1.0 - a);
@@ -294,7 +304,7 @@ fn tnt_vapor(dir: vec3<f32>, scene_dist: f32, b: TntBlast) -> f32 {
     let n = tnt_noise(radial * (4.0 / radius) + vec3<f32>(b.seed * 9.0, -b.age, 0.0));
     let band = tnt_fall(0.1, 1.4, abs(edge + (n - 0.5) * 1.2));
     let envelope = smoothstep(0.02, 0.12, b.age) * tnt_fall(0.55, 1.65, b.age);
-    return band * envelope * (0.35 + 0.45 * n);
+    return band * envelope * (0.12 + 0.18 * n);
 }
 
 // The dust the blast drives out along the ground: a low, clumpy ring that races out and settles.
@@ -404,29 +414,30 @@ fn tnt_shock(uv: vec2<f32>, dir: vec3<f32>, scene_dist: f32, ground: bool, b: Tn
     let ahead = length(centre) - front;
     let life = 1.0 - front / range;
     band = band * life * life * smoothstep(2.0, 12.0, ahead);
-    let pull = band * clamp(b.s / 4.5, 0.5, 1.6) * 0.03 * tnt_distortion;
+    let pull = band * clamp(b.s / 4.5, 0.5, 1.6) * 0.012 * tnt_distortion;
     return vec3<f32>(outward * vec2<f32>(1.0 / aspect, 1.0) * pull, band);
 }
 
-// Refract the background only where the ray crosses hot air around the fire.
+// Shimmer the background a little where the ray crosses the hot air rising over the fire: a
+// smooth field of noise, weak and short, never over the smoke's whole outline.
 fn tnt_heat_haze(dir: vec3<f32>, scene_dist: f32, b: TntBlast) -> vec2<f32> {
-    if tnt_distortion <= 0.0 || b.t >= 2.8 {
+    if tnt_distortion <= 0.0 || b.age >= 1.6 {
         return vec2<f32>(0.0);
     }
     let cl = tnt_cloud(b);
-    let centre = b.c + vec3<f32>(0.0, cl.yc, 0.0);
+    let centre = b.c + vec3<f32>(0.0, cl.yc + cl.rc * 0.6, 0.0);
     let along = dot(dir, centre);
     let q = (dir * along - centre) / cl.rc;
     let r = length(q);
-    if along <= 0.0 || scene_dist <= along || r >= 1.65 {
+    if along <= 0.0 || scene_dist <= along || r >= 1.4 {
         return vec2<f32>(0.0);
     }
-    let envelope = smoothstep(0.22, 0.72, r) * tnt_fall(0.94, 1.65, r)
-        * smoothstep(0.02, 0.16, b.t) * tnt_fall(0.6, 2.8, b.t);
-    let phase = tnt_noise(q * 4.0 + vec3<f32>(b.seed * 6.0, -b.age * 2.8, 0.0));
-    let wobble = vec2<f32>(sin(12.0 * q.y + 5.0 * phase), phase * 2.0 - 1.0);
+    let envelope = smoothstep(0.35, 0.8, r) * tnt_fall(0.9, 1.4, r) * smoothstep(-0.2, 0.3, q.y)
+        * smoothstep(0.02, 0.15, b.age) * tnt_fall(0.4, 1.6, b.age);
+    let p = q * 2.5 + vec3<f32>(b.seed * 6.0, -b.age * 3.0, 0.0);
+    let wobble = vec2<f32>(tnt_noise(p), tnt_noise(p + vec3<f32>(5.2, 1.3, 7.7))) * 2.0 - vec2<f32>(1.0);
     let aspect = frame.resolution.y / frame.resolution.x;
-    return wobble * vec2<f32>(aspect, 1.0) * (0.021 * min(cl.rc / along, 0.7) * envelope * tnt_distortion);
+    return wobble * vec2<f32>(aspect, 1.0) * (0.006 * min(cl.rc / along, 0.7) * envelope * tnt_distortion);
 }
 
 fn post(input: PostInput) -> vec4<f32> {
@@ -467,10 +478,10 @@ fn post(input: PostInput) -> vec4<f32> {
     if crest > 0.001 {
         let lo = vec2<f32>(0.001);
         let hi = vec2<f32>(0.999);
-        let red = textureSampleLevel(previous, linear_sampler, clamp(heated_uv - offset * 0.9, lo, hi), 0.0).r;
+        let red = textureSampleLevel(previous, linear_sampler, clamp(heated_uv - offset * 0.97, lo, hi), 0.0).r;
         let green = textureSampleLevel(previous, linear_sampler, clamp(heated_uv - offset, lo, hi), 0.0).g;
-        let blue = textureSampleLevel(previous, linear_sampler, clamp(heated_uv - offset * 1.1, lo, hi), 0.0).b;
-        colour = tnt_encode(vec3<f32>(red, green, blue)) + vec3<f32>(0.9, 0.85, 0.7) * (crest * 0.05);
+        let blue = textureSampleLevel(previous, linear_sampler, clamp(heated_uv - offset * 1.03, lo, hi), 0.0).b;
+        colour = tnt_encode(vec3<f32>(red, green, blue)) + vec3<f32>(0.9, 0.85, 0.7) * (crest * 0.015);
     } else if dot(haze, haze) > 1e-12 {
         colour = tnt_encode(textureSampleLevel(previous, linear_sampler,
             clamp(heated_uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).rgb);

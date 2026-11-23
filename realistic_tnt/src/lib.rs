@@ -26,6 +26,7 @@
 //! player sees it. Particles reach 32 blocks, as vanilla's do.
 mod command;
 mod config;
+mod shader_pack;
 
 use mod_api::{
     BlockEdit, BlockRun, BlockState, BlockUpdateFlags, CameraShakeEvent, ClientHost,
@@ -426,6 +427,7 @@ struct Mod;
 impl Hooks for Mod {
     fn register(&self, registrar: &mut dyn Registrar, context: &RegistrationContext) {
         config::load(context);
+        shader_pack::install(context);
         // The particles it sends, and the controller that holds the chunks of a burning mass.
         let _ = PARTICLES.set(Particle::ALL.map(|p| registrar.particle_key(p.id())));
         let _ = FUSE_TICKETS.set(registrar.register_ticket_controller("realistic_tnt:fuse", true));
@@ -2091,10 +2093,10 @@ fn carve(host: &mut dyn ServerHost, dimension: &str, job: &Work, from: f64, to: 
             only: Some(1),
         });
     }
-    if !edit.runs.is_empty() {
-        if let Err(error) = host.edit_blocks(dimension, &edit) {
-            eprintln!("[realistic_tnt] carve: block edit failed in {dimension}: {error}");
-        }
+    if !edit.runs.is_empty()
+        && let Err(error) = host.edit_blocks(dimension, &edit)
+    {
+        eprintln!("[realistic_tnt] carve: block edit failed in {dimension}: {error}");
     }
 }
 
@@ -2132,10 +2134,10 @@ fn scorch_ring(host: &mut dyn ServerHost, dimension: &str, job: &Work, from: f64
             });
         }
     }
-    if !edit.runs.is_empty() {
-        if let Err(error) = host.edit_blocks(dimension, &edit) {
-            eprintln!("[realistic_tnt] scorch_ring: block edit failed in {dimension}: {error}");
-        }
+    if !edit.runs.is_empty()
+        && let Err(error) = host.edit_blocks(dimension, &edit)
+    {
+        eprintln!("[realistic_tnt] scorch_ring: block edit failed in {dimension}: {error}");
     }
 }
 

@@ -1,6 +1,6 @@
 id = "realistic_tnt"
 name = "Realistic TNT"
-version = "0.6.0"
+version = "0.7.0"
 description = "Explosions with a fireball, mushroom cloud, real craters and a shockwave that flattens what it sweeps over. TNT adds up with no limit."
 authors = ["stealer0002"]
 license = "MIT"
@@ -14,5 +14,5 @@ capabilities = ["registries"]
 
 [native]
 game = "26.3"
-horizon = "0b14f8acfd97fa2c750e42795249dcc981178ca4"
+horizon = "f1bb66f353cf67f2aa4665293fc75c8d91186fc7"
 mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"

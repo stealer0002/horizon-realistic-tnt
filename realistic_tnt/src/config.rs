@@ -3,7 +3,7 @@ use std::{io::ErrorKind, path::PathBuf, str::FromStr, sync::OnceLock};
 use mod_api::{InstanceDirectory, RegistrationContext};
 
 #[derive(Clone, Copy)]
-pub(super) struct Config {
+pub(super) struct Tuning {
     pub escape_speed: f32,
     pub max_fold: usize,
     pub hold_chunks: i32,
@@ -13,7 +13,7 @@ pub(super) struct Config {
     pub knockback: f64,
 }
 
-const DEFAULTS: Config = Config {
+const DEFAULTS: Tuning = Tuning {
     escape_speed: super::ESCAPE_SPEED,
     max_fold: super::MAX_FOLD,
     hold_chunks: super::HOLD_CHUNKS,
@@ -23,9 +23,9 @@ const DEFAULTS: Config = Config {
     knockback: super::KNOCKBACK,
 };
 
-static CONFIG: OnceLock<Config> = OnceLock::new();
+static CONFIG: OnceLock<Tuning> = OnceLock::new();
 
-pub(super) fn get() -> &'static Config {
+pub(super) fn get() -> &'static Tuning {
     CONFIG.get().unwrap_or(&DEFAULTS)
 }
 
@@ -50,7 +50,7 @@ pub(super) fn load(context: &RegistrationContext) {
     });
 }
 
-fn native_path(directory: &InstanceDirectory) -> Option<PathBuf> {
+pub(super) fn native_path(directory: &InstanceDirectory) -> Option<PathBuf> {
     match directory {
         #[cfg(unix)]
         InstanceDirectory::Unix(bytes) => {
@@ -66,7 +66,7 @@ fn native_path(directory: &InstanceDirectory) -> Option<PathBuf> {
     }
 }
 
-fn parse(contents: &str) -> Config {
+fn parse(contents: &str) -> Tuning {
     let mut config = DEFAULTS;
     for (index, line) in contents.lines().enumerate() {
         let line = line.split('#').next().unwrap_or_default().trim();
@@ -83,7 +83,7 @@ fn parse(contents: &str) -> Config {
     config
 }
 
-fn apply(config: &mut Config, key: &str, value: &str) -> bool {
+fn apply(config: &mut Tuning, key: &str, value: &str) -> bool {
     match key {
         "ESCAPE_SPEED" => set(&mut config.escape_speed, value, |n| {
             n.is_finite() && n > 0.0
@@ -116,10 +116,7 @@ fn apply(config: &mut Config, key: &str, value: &str) -> bool {
     }
 }
 
-fn set<T: FromStr>(field: &mut T, value: &str, valid: impl FnOnce(T) -> bool) -> bool
-where
-    T: Copy,
-{
+fn set<T: FromStr + Copy>(field: &mut T, value: &str, valid: impl FnOnce(T) -> bool) -> bool {
     let Ok(value) = value.parse::<T>() else {
         return false;
     };
