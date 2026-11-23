@@ -2080,7 +2080,9 @@ fn carve(host: &mut dyn ServerHost, dimension: &str, job: &Work, from: f64, to: 
         });
     }
     if !edit.runs.is_empty() {
-        let _ = host.edit_blocks(dimension, &edit);
+        if let Err(error) = host.edit_blocks(dimension, &edit) {
+            eprintln!("[realistic_tnt] carve: block edit failed in {dimension}: {error}");
+        }
     }
 }
 
@@ -2119,7 +2121,9 @@ fn scorch_ring(host: &mut dyn ServerHost, dimension: &str, job: &Work, from: f64
         }
     }
     if !edit.runs.is_empty() {
-        let _ = host.edit_blocks(dimension, &edit);
+        if let Err(error) = host.edit_blocks(dimension, &edit) {
+            eprintln!("[realistic_tnt] scorch_ring: block edit failed in {dimension}: {error}");
+        }
     }
 }
 
@@ -2445,7 +2449,9 @@ fn lift(
     if edit.runs.is_empty() {
         return;
     }
-    let _ = host.edit_blocks(dimension, &edit);
+    if let Err(error) = host.edit_blocks(dimension, &edit) {
+        eprintln!("[realistic_tnt] lift: block edit failed in {dimension}: {error}");
+    }
     // The nearest fly first, out and up, harder the harder they are pushed, until the level holds
     // all it will; crumbs burst where a player is close.
     flying.sort_by(|a, b| a.0.total_cmp(&b.0));
