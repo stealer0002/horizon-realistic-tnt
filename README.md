@@ -148,8 +148,6 @@ blast does not throw the lit TNT out of its mass.
 
 ## Install
 
-> Em português: [INSTALAR.md](INSTALAR.md).
-
 Realistic TNT is a native mod: real code, compiled for **one exact Horizon**, Nightly 2026-11-22
 ([`f1bb66f`](https://github.com/horizon-rust/horizon/commit/f1bb66f353cf67f2aa4665293fc75c8d91186fc7)).
 The launcher builds it for that Horizon and keeps an instance on it, so a later Horizon update does
@@ -180,9 +178,15 @@ and allow native code. Or:
 horizon-launcher mods add-github https://github.com/stealer0002/horizon-realistic-tnt/releases/tag/v0.11.0 --instance "Realistic TNT" --trust-native-code
 ```
 
-The launcher fetches Horizon Nightly 2026-11-22 if you don't have it, compiles the mod against it
-(a few minutes the first time) and makes the instance play that build. A native mod runs with your
-rights, which is why the launcher asks you to trust it: the whole source is in this repository.
+That installs the mod; now build it into the instance:
+
+```sh
+horizon-launcher native-build --instance "Realistic TNT" --trust-native-code
+```
+
+The launcher compiles the mod against the Horizon it pins (Nightly 2026-11-22, `f1bb66f`; a few
+minutes the first time) and makes the instance play that build. A native mod runs with your rights,
+which is why the launcher asks you to trust it: the whole source is in this repository.
 
 ### 3. Play
 
