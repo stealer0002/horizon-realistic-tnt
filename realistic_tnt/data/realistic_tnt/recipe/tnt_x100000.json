@@ -1,0 +1,19 @@
+{
+  "type": "minecraft:crafting_shapeless",
+  "category": "redstone",
+  "ingredients": [
+    "realistic_tnt:tnt_x10000",
+    "realistic_tnt:tnt_x10000",
+    "realistic_tnt:tnt_x10000",
+    "realistic_tnt:tnt_x10000",
+    "realistic_tnt:tnt_x10000",
+    "realistic_tnt:tnt_x10000",
+    "realistic_tnt:tnt_x10000",
+    "realistic_tnt:tnt_x10000",
+    "realistic_tnt:tnt_x10000"
+  ],
+  "result": {
+    "id": "realistic_tnt:tnt_x100000",
+    "count": 1
+  }
+}

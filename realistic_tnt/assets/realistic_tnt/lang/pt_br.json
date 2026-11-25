@@ -1,0 +1,11 @@
+{
+  "block.realistic_tnt.tnt_x2": "TNT x2",
+  "block.realistic_tnt.tnt_x10": "TNT x10",
+  "block.realistic_tnt.tnt_x100": "TNT x100",
+  "block.realistic_tnt.tnt_x1000": "TNT x1.000",
+  "block.realistic_tnt.tnt_x10000": "TNT x10.000",
+  "block.realistic_tnt.tnt_x100000": "TNT x100.000",
+  "block.realistic_tnt.tnt_x1000000": "TNT x1.000.000",
+  "item.realistic_tnt.detonator": "Detonador remoto",
+  "itemGroup.realistic_tnt.tnt": "TNT realista"
+}

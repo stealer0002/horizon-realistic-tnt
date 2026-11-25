@@ -58,6 +58,46 @@ Distances in blocks from the centre of the blast:
 Land is torn up past the crater by blasts of 64 TNT or more; a single TNT keeps vanilla's blast, with
 the mod's effects on top.
 
+## TNT blocks
+
+The mod adds seven higher-yield TNT blocks under the **Realistic TNT** creative tab, so huge blasts
+do not need thousands of placed blocks:
+
+| Block | ID | Worth (in TNT) | Shapeless recipe |
+|---|---|---:|---|
+| TNT x2 | `realistic_tnt:tnt_x2` | 2 | 2 × TNT |
+| TNT x10 | `realistic_tnt:tnt_x10` | 10 | 5 × TNT x2 |
+| TNT x100 | `realistic_tnt:tnt_x100` | 100 | 9 × TNT x10 |
+| TNT x1,000 | `realistic_tnt:tnt_x1000` | 1,000 | 9 × TNT x100 |
+| TNT x10,000 | `realistic_tnt:tnt_x10000` | 10,000 | 9 × TNT x1,000 |
+| TNT x100,000 | `realistic_tnt:tnt_x100000` | 100,000 | 9 × TNT x10,000 |
+| TNT x1,000,000 | `realistic_tnt:tnt_x1000000` | 1,000,000 | 9 × TNT x100,000 |
+
+They break instantly and drop themselves when mined, and light as vanilla TNT does:
+
+- **Redstone:** any adjacent redstone signal lights them, including immediately if placed where a
+  signal already reaches.
+- **Flint and steel / fire charge:** right-clicking lights the block (wearing down the flint and
+  steel or using a fire charge outside Creative).
+- **Fire and explosions:** spreading fire and nearby blasts prime them instead of breaking them.
+
+Each lit block spawns a primed TNT showing that block's own texture and explodes with its full
+worth. Touching TNT blocks — vanilla or valued — still fold into one mass and add their worths
+together, up to `10,000,000` TNT per blast.
+
+## Remote detonator
+
+The **Remote Detonator** (`realistic_tnt:detonator`, under the **Realistic TNT** creative tab)
+is crafted from 1 redstone torch, 3 iron ingots and 1 redstone dust:
+
+- **Link / unlink:** right-click any vanilla or valued TNT block to link it to that detonator
+  (up to 64 links per detonator, stored per dimension on the item); right-click a linked block
+  again to unlink it.
+- **Fire:** right-click in the air to light every linked TNT block at once with a fixed **5 second
+  (100 tick)** fuse, overriding the mod's stretched fuse while keeping touching blocks folding into
+  one mass and summing their worths. Links are cleared on firing; blocks that were broken or
+  replaced, or that lie in unloaded chunks, are skipped and reported.
+
 ## What every explosion does
 
 TNT, creepers, beds, end crystals: every explosion gets all of this.
@@ -69,12 +109,13 @@ TNT, creepers, beds, end crystals: every explosion gets all of this.
 | Flash | The whole picture whitens for an instant (an option of the pack; 0 turns it off). | yes |
 | Shockwave | A sphere of bent air races out, with colour fringes. | yes |
 | Dust skirt | A low ring of dust races out along the ground and settles. | yes, plus dust pillars without it |
+| Condensation ring | Round a big blast's mushroom (from about 64 TNT, in full from a few thousand), the shockwave chills the damp air into a ragged white ring (a Wilson cloud) that drifts slowly outwards and frays away. | yes |
 | Debris | Plain terrain and wood the blast breaks flies as falling blocks, trailing smoke, and lands as rubble. Ores, containers and block-entity blocks are left to the blast, so loot is not lost. | no |
 | Sparks, flames, crumbs | A flash particle, lava sparks, a burst of flame and crumbs of the ground it tore up. | no |
 | Smoke and ash | A column of smoke with a cloud at its top, embers at its foot, ash falling afterwards. | no |
 | Scorched ground | Grass and soil round the crater char to coarse dirt, plants burn away. | no |
 | Camera shake | A jolt as it goes off, then a shake when the shockwave reaches you (scaled by the game's Distortion Effects option). | no |
-| Delayed boom | A deep boom, a thump and rolling thunder, heard when the shockwave arrives: later the farther you are. Vanilla's own explosion sound is dropped, so the boom is not heard twice. | no |
+| Sound | Heard as a real blast is (after the 2020 Beirut blast's recordings): the fireball's roar with the flash, the ground rumbling ahead of the air wave, then, as the shockwave arrives, a sharp crack and the boom (heavy close by, a dull thud far off, where the air has taken its high pitches), the boom rolling on like thunder, debris raining down, and close by the ears ringing while the world sounds muffled. It grows with the yield: one TNT is a crisp, punchy bang; tens of TNT shake the ground; a nuclear-sized blast roars for seconds, rolls on for twenty and its wind howls after it. The booms, rumbles, debris and cracks are real explosions, recorded (the SSE Library's *EXPLOSIONS*, USC Cinema / Sunset Editorial, CC0 1.0, on the Internet Archive), given back the deep lows old tape lost and the chest-thumping blow of a blast felt close by; the flash, ground, wind and ringing are synthesised (`assets/realistic_tnt/sounds/`, all made by `tools/make_sounds.py`); vanilla's explosion sound is dropped, so the blast is not heard twice. | no |
 | Shockwave damage and push | As the front reaches them, mobs and players are hurt and thrown away from the blast, less the farther out. | no |
 | Knockback | The explosion's own push is 35% harder, times the cube root of the yield. | no |
 | Crater | A blast of more than one TNT digs its own crater, ring by ring as its front passes: a bowl, everything above it cut away, a charred floor (blackstone, coarse dirt, magma near the middle), the land round it scorched, blocks flung out of it. | no |
@@ -135,7 +176,7 @@ files below are the same packs, for players who want them on their own.
 
 | Pack | What it is |
 |---|---|
-| `realistic_tnt_shockwave-0.5.0.hshader` | The explosion pass alone, over the game's vanilla look (shader API 0.2). The mod installs this one by itself |
+| `realistic_tnt_shockwave-0.6.0.hshader` | The explosion pass alone, over the game's vanilla look (shader API 0.2). The mod installs this one by itself |
 | `wisdom_horizon_tnt-1.3.7-tnt6.hshader` | Wisdom Shaders V3 (Horizon port) with the explosion pass added: the look in the video. It is a shader API 0.1 pack, which Horizon no longer loads since 2026-11-13: kept for older builds only |
 
 Without a shader pack, everything marked "no" in the table above still works.
@@ -200,11 +241,15 @@ KNOCKBACK = 1.35
 ```
 realistic_tnt/                 the mod's project: what `native-build` builds and `.hmod` packs
   horizon-mod.toml             id, version, the Horizon build it is made for
-  src/lib.rs                   the blast, fuse and effects logic, with unit tests
+  src/lib.rs                   the blast, fuse, valued-TNT and effects logic, with unit tests
   src/command.rs               server-side /tnt command
   src/config.rs                instance tuning and config parser tests
+  src/destruction.rs           crater rim, wall slumping, blast fires, baked ground and debris craters
+  src/detonator.rs             remote detonator item behaviour and link-list tests
   src/shader_pack.rs           installs the explosion shader pack into shaderpacks/ on start
   src/shader_pack_files.rs     that pack's files, generated by tools/embed_shader.py
+  assets/realistic_tnt/        valued TNT and detonator models, textures, lang files and blast sounds
+  data/realistic_tnt/          valued TNT blocks, detonator item, recipes, loot tables and creative tab
 shader/
   realistic_tnt_shockwave/     the explosion pass on its own (source)
   wisdom_horizon_tnt/          Wisdom Shaders V3 (Horizon port) with that pass added (source)
@@ -213,6 +258,9 @@ tools/
   check.ps1                    checks and unit-tests the mod with the pinned build's mod SDK
   embed_shader.py              packs shader/realistic_tnt_shockwave/ and embeds it in the mod:
                                run it after every change to the shader
+  make_blocks.py               writes the valued TNT blocks, textures, recipes, loot and lang files
+  make_sounds.py               generates the blast's .ogg sound files under assets/realistic_tnt/sounds/
+                               (fetches its CC0 recordings into tools/sounds-source/ the first time)
   diagrams.py                  draws media/blast-*.svg from the mod's own formulas
   shoot.py, bigtest.py, ...    drive a test copy of the game through `horizon-ctl` to photograph
                                explosions and check fuses, far-away blasts and torn-up land

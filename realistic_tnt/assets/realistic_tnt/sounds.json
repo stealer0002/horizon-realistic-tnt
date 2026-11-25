@@ -1,0 +1,128 @@
+{
+  "blast.flash_small": {
+    "sounds": [
+      {
+        "name": "realistic_tnt:blast/flash_small"
+      }
+    ]
+  },
+  "blast.flash": {
+    "sounds": [
+      {
+        "name": "realistic_tnt:blast/flash"
+      }
+    ]
+  },
+  "blast.flash_huge": {
+    "sounds": [
+      {
+        "name": "realistic_tnt:blast/flash_huge"
+      }
+    ]
+  },
+  "blast.ground": {
+    "sounds": [
+      {
+        "name": "realistic_tnt:blast/ground"
+      }
+    ]
+  },
+  "blast.crack": {
+    "sounds": [
+      {
+        "name": "realistic_tnt:blast/crack1"
+      },
+      {
+        "name": "realistic_tnt:blast/crack2"
+      }
+    ]
+  },
+  "blast.boom_small": {
+    "sounds": [
+      {
+        "name": "realistic_tnt:blast/boom_small1"
+      },
+      {
+        "name": "realistic_tnt:blast/boom_small2"
+      }
+    ]
+  },
+  "blast.boom_medium": {
+    "sounds": [
+      {
+        "name": "realistic_tnt:blast/boom_medium1"
+      },
+      {
+        "name": "realistic_tnt:blast/boom_medium2"
+      }
+    ]
+  },
+  "blast.boom_large": {
+    "sounds": [
+      {
+        "name": "realistic_tnt:blast/boom_large1"
+      },
+      {
+        "name": "realistic_tnt:blast/boom_large2"
+      }
+    ]
+  },
+  "blast.boom_huge": {
+    "sounds": [
+      {
+        "name": "realistic_tnt:blast/boom_huge1"
+      },
+      {
+        "name": "realistic_tnt:blast/boom_huge2"
+      }
+    ]
+  },
+  "blast.boom_far": {
+    "sounds": [
+      {
+        "name": "realistic_tnt:blast/boom_far1"
+      },
+      {
+        "name": "realistic_tnt:blast/boom_far2"
+      }
+    ]
+  },
+  "blast.rumble": {
+    "sounds": [
+      {
+        "name": "realistic_tnt:blast/rumble1"
+      },
+      {
+        "name": "realistic_tnt:blast/rumble2"
+      }
+    ]
+  },
+  "blast.rumble_huge": {
+    "sounds": [
+      {
+        "name": "realistic_tnt:blast/rumble_huge"
+      }
+    ]
+  },
+  "blast.wind": {
+    "sounds": [
+      {
+        "name": "realistic_tnt:blast/wind"
+      }
+    ]
+  },
+  "blast.debris": {
+    "sounds": [
+      {
+        "name": "realistic_tnt:blast/debris"
+      }
+    ]
+  },
+  "blast.ringing": {
+    "sounds": [
+      {
+        "name": "realistic_tnt:blast/ringing"
+      }
+    ]
+  }
+}

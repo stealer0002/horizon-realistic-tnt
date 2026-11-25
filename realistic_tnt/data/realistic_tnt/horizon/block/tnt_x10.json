@@ -1,0 +1,8 @@
+{
+  "template": "minecraft:oak_planks",
+  "properties": {
+    "hardness": 0.0,
+    "sounds": "minecraft:tnt"
+  },
+  "item": true
+}

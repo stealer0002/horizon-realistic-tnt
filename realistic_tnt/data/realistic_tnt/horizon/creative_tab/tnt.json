@@ -1,0 +1,15 @@
+{
+  "title": "itemGroup.realistic_tnt.tnt",
+  "icon": "realistic_tnt:tnt_x1000000",
+  "items": [
+    "minecraft:tnt",
+    "realistic_tnt:detonator",
+    "realistic_tnt:tnt_x2",
+    "realistic_tnt:tnt_x10",
+    "realistic_tnt:tnt_x100",
+    "realistic_tnt:tnt_x1000",
+    "realistic_tnt:tnt_x10000",
+    "realistic_tnt:tnt_x100000",
+    "realistic_tnt:tnt_x1000000"
+  ]
+}

@@ -27,17 +27,19 @@
 mod command;
 mod config;
 mod destruction;
+mod detonator;
 mod shader_pack;
 
 use mod_api::{
     BlockEdit, BlockRun, BlockState, BlockUpdateFlags, CameraShakeEvent, ClientHost,
-    ClientTickPostEvent, Compound, EntityRef, ExplosionDetonateEvent, ExplosionKnockbackEvent,
-    ExplosionStartEvent, Falling, Flow, Heightmap, Hooks, Host, HostSide, Identifier, LevelRef,
-    LevelTickPostEvent, LevelUnloadEvent, LoopContext, ParticleKey, ParticleOptions, PlayerRef,
-    PlaySoundEvent,
-    RegistrationContext, Registrar, ServerHost, ServerStoppingEvent, ShaderParamsEvent,
-    SoundAttenuation, SoundPlay, SoundSource, StatePredicate, Tag, Text, HostBlockStates,
-    TicketController, TicketOwner, TntPrimedEvent, ValidateTicketsEvent,
+    ClientTickPostEvent, Compound, EntityRef, EquipmentSlot, ExplosionDetonateEvent,
+    ExplosionKnockbackEvent, ExplosionStartEvent, Falling, Flow, Hand, Heightmap, Hooks, Host,
+    HostSide, Identifier, LevelRandomHost, LevelRef, LevelSide, LevelTickPostEvent,
+    LevelUnloadEvent, LivingIncomingDamageEvent, LoopContext, OnBlockStateChangeEvent,
+    ParticleKey, ParticleOptions, PlaySoundEvent, PlayerRef, RegistrationContext, Registrar,
+    ServerHost, ServerStoppingEvent, ShaderParamsEvent, SoundAttenuation, SoundPlay, SoundSource,
+    StatePredicate, Tag, Text, HostBlockStates, TicketController, TicketOwner, TntPrimedEvent,
+    ValidateTicketsEvent,
 };
 use mod_api::text::TextStyle;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -124,7 +126,7 @@ const BIG_YIELD: f32 = 1.5;
 /// the blast that follows).
 const MAX_FOLD: usize = 200_000;
 /// The shockwave's damage near a one-TNT blast, in health points, and its push, in blocks a tick.
-const SHOCK_DAMAGE: f32 = 16.0;
+const SHOCK_DAMAGE: f32 = 32.0;
 const SHOCK_PUSH: f64 = 1.3;
 /// The most columns of crater dug in one tick: past it the digging falls behind the front.
 const CARVE_PER_TICK: f64 = 6000.0;
@@ -278,9 +280,10 @@ struct Fuse {
     dimension: String,
     /// The block that was lit.
     pos: [i32; 3],
-    /// How many TNT it will set off, itself included, the box they fill and the blocks they were
-    /// in when it was lit (a TNT lit next to them later goes off with it).
-    mass: usize,
+    /// How many TNT it will set off, itself included, each as much as it is worth (`tnt_worth`), the
+    /// box they fill and the blocks they were in when it was lit (a TNT lit next to them later goes
+    /// off with it).
+    mass: u64,
     lo: [i32; 3],
     hi: [i32; 3],
     cells: HashSet<[i32; 3]>,
@@ -304,10 +307,9 @@ struct Fuse {
     held: bool,
 }
 
-/// A fuse just lit at `pos` in the mass `cluster`.
-fn new_fuse(dimension: &str, pos: [i32; 3], cluster: &[[i32; 3]], total: i32) -> Fuse {
+/// A fuse just lit at `pos` in the mass `cluster`, worth `mass` TNT in all.
+fn new_fuse(dimension: &str, pos: [i32; 3], cluster: &[[i32; 3]], mass: u64, total: i32) -> Fuse {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let mass = mass_of(cluster, pos);
     let (lo, hi) = bounds_of(cluster, pos);
     Fuse {
         id,
@@ -423,8 +425,314 @@ fn window_at() -> std::sync::MutexGuard<'static, Option<(String, [f64; 3])>> {
     WINDOW_AT.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// The last explosion the server announced (`explosion_start`): its level, centre and radius, which
-/// `explosion_detonate` reads right after for its yield.
+/// The TNT blocks of greater worth this mod adds (`tools/make_blocks.py` writes their content), and
+/// how many TNT each is worth: one goes off as that many, and in a mass each counts that much.
+const VALUED_TNT: [(&str, u64); 7] = [
+    ("realistic_tnt:tnt_x2", 2),
+    ("realistic_tnt:tnt_x10", 10),
+    ("realistic_tnt:tnt_x100", 100),
+    ("realistic_tnt:tnt_x1000", 1_000),
+    ("realistic_tnt:tnt_x10000", 10_000),
+    ("realistic_tnt:tnt_x100000", 100_000),
+    ("realistic_tnt:tnt_x1000000", 1_000_000),
+];
+/// No blast is bigger than this many TNT, however much is piled: its crater, about 970 blocks in
+/// radius, is as much as a server digs in under a minute.
+const MAX_YIELD: f32 = 10_000_000.0;
+
+/// How many TNT a block named `name` is worth: vanilla's TNT 1, this mod's own more; none for
+/// any other block.
+fn tnt_worth(name: &str) -> Option<u64> {
+    if name == "minecraft:tnt" {
+        return Some(1);
+    }
+    VALUED_TNT.iter().find(|(id, _)| *id == name).map(|&(_, worth)| worth)
+}
+
+/// How close an explosion's centre must be to a tracked primed TNT's last position to claim its
+/// worth when `ExplosionStart::source` is absent.
+const LIT_MATCH_RADIUS: f64 = 2.25;
+
+/// A primed TNT this mod lit from one of its blocks of greater worth (`light`), tracked for
+/// `explosion_start` (which may see no `source` entity id and matches by last known position in the
+/// same dimension).
+#[derive(Clone, Debug, PartialEq)]
+struct LitWorth {
+    worth: u64,
+    pos: [f64; 3],
+    dimension: String,
+    /// True once `host.entity(id)` stopped resolving; kept for one more tick in case its explosion
+    /// runs after removal, then dropped.
+    gone: bool,
+}
+
+/// The primed TNT this mod lit from one of its blocks of greater worth (`light`), by entity id,
+/// and what each is worth, where it last was and in which dimension, for its explosion's yield
+/// (`explosion_start`).
+static LIT_WORTH: Mutex<Option<HashMap<u32, LitWorth>>> = Mutex::new(None);
+
+fn lit_worth<R>(f: impl FnOnce(&mut HashMap<u32, LitWorth>) -> R) -> R {
+    let mut guard = LIT_WORTH.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(guard.get_or_insert_with(HashMap::new))
+}
+
+/// One of this mod's blocks of greater worth to light on its level's next tick: lit by a signal,
+/// a flint and steel or a fire charge, or fire (`ValuedTnt`), at `pos`, what it is and is worth,
+/// and whether its block is still there to take away (fire takes it itself).
+struct ToLight {
+    dimension: String,
+    pos: [i32; 3],
+    name: &'static str,
+    worth: u64,
+    take: bool,
+}
+
+static TO_LIGHT: Mutex<Vec<ToLight>> = Mutex::new(Vec::new());
+/// Newly placed valued TNT positions whose redstone signal is checked on the level's next tick.
+static CHECK_SIGNAL: Mutex<Vec<(String, [i32; 3])>> = Mutex::new(Vec::new());
+
+std::thread_local! {
+    /// Suppresses `on_block_state_change` signal re-queueing when `light` puts a refused block back.
+    static RESTORING_VALUED_TNT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Marks damage dealt by `shockwave` so `living_incoming_damage` only cancels Tick-0 vanilla damage.
+    static IN_SHOCKWAVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn to_light() -> std::sync::MutexGuard<'static, Vec<ToLight>> {
+    TO_LIGHT.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn check_signal() -> std::sync::MutexGuard<'static, Vec<(String, [i32; 3])>> {
+    CHECK_SIGNAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The blocks of greater worth as the game keyed them when the mod registered.
+static VALUED_KEYS: OnceLock<Vec<(mod_api::BlockKey, &'static str, u64)>> = OnceLock::new();
+
+/// What the block `key` is and is worth, if it is one of this mod's blocks of greater worth.
+fn valued(key: mod_api::BlockKey) -> Option<(&'static str, u64)> {
+    VALUED_KEYS.get()?.iter().find(|(k, _, _)| *k == key).map(|&(_, name, worth)| (name, worth))
+}
+
+/// The code on each of this mod's blocks of greater worth: it is lit as TNT is (a redstone signal,
+/// including when placed in one, a flint and steel or a fire charge, fire), by the mod, so that it
+/// goes off as big as it is worth. Its block copies a plain block (`tools/make_blocks.py`), so the
+/// game never lights it as one TNT.
+struct ValuedTnt;
+
+fn queue_light(dimension: mod_api::LevelDimension, pos: mod_api::BlockPos, state: BlockState, take: bool) -> bool {
+    let dimension = dimension.key().id().to_owned();
+    let pos = [pos.x, pos.y, pos.z];
+    if let Some((name, worth)) = valued(state.block()) {
+        let mut all = to_light();
+        if !all.iter().any(|l| l.pos == pos && l.dimension == dimension) {
+            all.push(ToLight { dimension, pos, name, worth, take });
+            return true;
+        }
+    }
+    false
+}
+
+#[mod_api::horizon_part]
+impl mod_api::BlockPart for ValuedTnt {
+    fn neighbor_changed(&self, level: &mut dyn mod_api::LevelTicksHost, event: &mut mod_api::NeighborChangedEvent) {
+        if level.has_neighbor_signal([event.pos.x, event.pos.y, event.pos.z]) {
+            queue_light(event.dimension, event.pos, event.state, true);
+        }
+    }
+
+    fn on_block_state_change(&self, level: LevelSide, event: &mut OnBlockStateChangeEvent) {
+        if !matches!(level, LevelSide::Server(_)) || event.predicted {
+            return;
+        }
+        if event.old.block() == event.new.block() || event.state.block() != event.new.block() {
+            return;
+        }
+        if RESTORING_VALUED_TNT.with(|flag| flag.get()) {
+            return;
+        }
+        let dimension = event.dimension.key().id().to_owned();
+        let pos = [event.pos.x, event.pos.y, event.pos.z];
+        let mut pending = check_signal();
+        if !pending.contains(&(dimension.clone(), pos)) {
+            pending.push((dimension, pos));
+        }
+    }
+
+    fn use_item_on(&self, host: &mut dyn ServerHost, event: &mut mod_api::UseItemOnEvent<'_>) -> Option<mod_api::InteractionResult> {
+        let stack = event.click.stack?;
+        let item = stack.item().id(&*host);
+        if item != "minecraft:flint_and_steel" && item != "minecraft:fire_charge" {
+            return None;
+        }
+        let pos = mod_api::BlockPos { x: event.click.pos[0], y: event.click.pos[1], z: event.click.pos[2] };
+        if queue_light(event.click.dimension, pos, event.state, true)
+            && let Some(player) = host.player(event.click.player)
+            && !player.has_infinite_materials(&*host).unwrap_or(false)
+            && let Some(living) = host.living(player.entity())
+        {
+            if item == "minecraft:flint_and_steel" {
+                let slot = match event.click.hand {
+                    Hand::Main => EquipmentSlot::MainHand,
+                    Hand::Off => EquipmentSlot::OffHand,
+                };
+                living.hurt_and_break(host, slot, 1);
+            } else {
+                let _ = living.set_hand_item(host, event.click.hand, stack.clone().shrink(1));
+            }
+        }
+        Some(mod_api::InteractionResult::Success)
+    }
+
+    fn on_caught_fire(&self, _level: &mut dyn mod_api::LevelWriteHost, event: &mut mod_api::OnCaughtFireEvent) {
+        // Fire puts itself (or air) where the block was: the mod only lights the TNT.
+        queue_light(event.dimension, event.pos, event.state, false);
+    }
+}
+
+/// Refreshes tracked primed TNT positions in `dimension` and drops entries that stayed gone past
+/// one extra tick.
+fn refresh_lit_worth(host: &mut dyn ServerHost, dimension: &str) {
+    let tracked: Vec<u32> = lit_worth(|all| {
+        all.iter()
+            .filter(|(_, entry)| entry.dimension == dimension)
+            .map(|(&id, _)| id)
+            .collect()
+    });
+    if tracked.is_empty() {
+        return;
+    }
+    let positions: Vec<(u32, Option<[f64; 3]>)> = tracked
+        .into_iter()
+        .map(|id| (id, host.entity(id).and_then(|entity| entity.position(&*host))))
+        .collect();
+    lit_worth(|all| {
+        for (id, pos) in positions {
+            let Some(entry) = all.get_mut(&id) else {
+                continue;
+            };
+            if let Some(pos) = pos {
+                entry.pos = pos;
+                entry.gone = false;
+            } else if entry.gone {
+                all.remove(&id);
+            } else {
+                entry.gone = true;
+            }
+        }
+    });
+}
+
+/// Picks the tracked primed TNT id in `entries` matching an explosion at `center` in `dimension`.
+/// When `source` is present, only that id can match so creepers or other sourced explosions never
+/// claim a nearby lit TNT's worth. When `source` is absent, picks the nearest entry in `dimension`
+/// within `LIT_MATCH_RADIUS` whose live fuse (if still alive) is not still burning above 1 tick.
+fn pick_lit_worth(
+    entries: &HashMap<u32, LitWorth>,
+    source: Option<u32>,
+    dimension: &str,
+    center: [f64; 3],
+    live: &HashMap<u32, ([f64; 3], Option<i32>)>,
+) -> Option<u32> {
+    if let Some(id) = source {
+        return entries.contains_key(&id).then_some(id);
+    }
+    entries
+        .iter()
+        .filter(|(_, entry)| entry.dimension == dimension)
+        .filter_map(|(&id, entry)| {
+            let (pos, fuse) = live.get(&id).copied().unwrap_or((entry.pos, None));
+            if fuse.is_some_and(|ticks| ticks > 1) {
+                return None;
+            }
+            let dist = distance(pos, center);
+            (dist <= LIT_MATCH_RADIUS).then_some((dist, id))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
+        .map(|(_, id)| id)
+}
+
+/// Finds and removes the tracked primed TNT worth for `explosion_start`.
+fn take_lit_worth(host: &mut dyn ServerHost, source: Option<u32>, dimension: &str, center: [f64; 3]) -> Option<u64> {
+    if let Some(id) = source {
+        return lit_worth(|all| all.remove(&id).map(|entry| entry.worth));
+    }
+    let candidates: Vec<u32> = lit_worth(|all| {
+        all.iter()
+            .filter(|(_, entry)| entry.dimension == dimension)
+            .map(|(&id, _)| id)
+            .collect()
+    });
+    if candidates.is_empty() {
+        return None;
+    }
+    let mut live = HashMap::with_capacity(candidates.len());
+    for id in candidates {
+        if let Some(pos) = host.entity(id).and_then(|entity| entity.position(&*host)) {
+            live.insert(id, (pos, live_fuse(host, id)));
+        }
+    }
+    let matched = lit_worth(|all| {
+        let id = pick_lit_worth(all, None, dimension, center, &live)?;
+        let entry = all.remove(&id)?;
+        Some((id, entry.worth, live.get(&id).copied()))
+    });
+    if let Some((id, worth, state)) = matched {
+        destruction::debug(format_args!(
+            "matched primed TNT {id} (worth {worth}) at {center:?} in {dimension}: live={state:?}"
+        ));
+        Some(worth)
+    } else {
+        None
+    }
+}
+
+/// Lights the blocks of greater worth queued for `level` (`TO_LIGHT`), after checking any newly
+/// placed blocks in `CHECK_SIGNAL` that stand in a redstone signal.
+fn light_queued(host: &mut dyn ServerHost, level: LevelRef, dimension: &str) {
+    let placed: Vec<[i32; 3]> = {
+        let mut pending = check_signal();
+        let (here, rest): (Vec<_>, Vec<_>) = pending.drain(..).partition(|(dim, _)| dim == dimension);
+        *pending = rest;
+        here.into_iter().map(|(_, pos)| pos).collect()
+    };
+    for pos in placed {
+        if !level.has_neighbor_signal(&*host, pos) {
+            continue;
+        }
+        let name = block_at(&*host, level, pos);
+        if let Some(&(static_name, worth)) = VALUED_TNT.iter().find(|&&(id, _)| id == name) {
+            let mut all = to_light();
+            if !all.iter().any(|l| l.pos == pos && l.dimension == dimension) {
+                all.push(ToLight {
+                    dimension: dimension.to_owned(),
+                    pos,
+                    name: static_name,
+                    worth,
+                    take: true,
+                });
+            }
+        }
+    }
+    let here: Vec<ToLight> = {
+        let mut all = to_light();
+        let (here, rest): (Vec<_>, Vec<_>) = all.drain(..).partition(|l| l.dimension == dimension);
+        *all = rest;
+        here
+    };
+    for l in here {
+        // A block taken away meanwhile (broken, pushed) is not lit.
+        if l.take && block_at(&*host, level, l.pos) != l.name {
+            continue;
+        }
+        if light(host, level, dimension, l.pos, l.name, l.worth, FUSE_TICKS, l.take).is_some() {
+            follow_lit(host, level, dimension, l.pos, l.worth);
+        }
+    }
+}
+
+/// The last explosion the server announced (`explosion_start`): its level, centre and yield in TNT,
+/// which `explosion_detonate` reads right after.
 static LAST_START: Mutex<Option<(String, [f64; 3], f32)>> = Mutex::new(None);
 
 fn last_start() -> std::sync::MutexGuard<'static, Option<(String, [f64; 3], f32)>> {
@@ -442,6 +750,17 @@ impl Hooks for Mod {
         // The particles it sends, and the controller that holds the chunks of a burning mass.
         let _ = PARTICLES.set(Particle::ALL.map(|p| registrar.particle_key(p.id())));
         let _ = FUSE_TICKETS.set(registrar.register_ticket_controller("realistic_tnt:fuse", true));
+        // The blocks of greater worth, each with the code that lights it.
+        let keys: Vec<_> = VALUED_TNT
+            .iter()
+            .map(|&(name, worth)| (registrar.block_key(name), name, worth))
+            .collect();
+        for &(key, _, _) in &keys {
+            registrar.block_part(key, ValuedTnt);
+        }
+        let _ = VALUED_KEYS.set(keys);
+        let detonator_key = registrar.item_key(detonator::DETONATOR_ID);
+        registrar.item_part(detonator_key, detonator::Detonator);
     }
 
     fn register_commands(&self, _host: &mut dyn ServerHost, event: &mut mod_api::RegisterCommandsEvent<'_>) {
@@ -466,9 +785,13 @@ impl Hooks for Mod {
         }
     }
 
-    fn explosion_start(&self, _host: &mut dyn ServerHost, event: &mut ExplosionStartEvent<'_>) -> Flow {
+    fn explosion_start(&self, host: &mut dyn ServerHost, event: &mut ExplosionStartEvent<'_>) -> Flow {
         let start = event.explosion;
-        *last_start() = Some((start.dimension.to_owned(), start.center, start.radius));
+        // TNT the mod lit from a block of greater worth goes off as that many; any other
+        // explosion as its radius tells.
+        let worth = take_lit_worth(host, start.source, start.dimension, start.center);
+        let yield_tnt = worth.map_or_else(|| yield_of(start.radius), |worth| worth as f32);
+        *last_start() = Some((start.dimension.to_owned(), start.center, yield_tnt.min(MAX_YIELD)));
         Flow::Continue
     }
 
@@ -481,26 +804,31 @@ impl Hooks for Mod {
         let own = last_start()
             .take()
             .filter(|(dim, at, _)| *dim == dimension && *at == center)
-            .map_or(1.0, |(_, _, radius)| yield_of(radius));
+            .map_or(1.0, |(_, _, yield_tnt)| yield_tnt);
         let cell = cell_of(center);
-        // TNT blocks touching it go off with it, now, instead of one by one after it.
-        let folded = {
+        // TNT blocks touching it go off with it, now, instead of one by one after it, each as
+        // much as it is worth.
+        let (folded, folded_worth) = {
             let look = |pos| block_at(&*host, level, pos);
             tnt_cluster(&look, cell, config::get().max_fold)
         };
         if !folded.is_empty() {
             remove_blocks(host, &dimension, &folded);
         }
-        let added = own + folded.len() as f32;
+        let added = (own + folded_worth as f32).min(MAX_YIELD);
         // A blast gone off beside it just now takes it in: their yields add up, and that blast
         // does the breaking.
         {
             let mut all = blasts();
             if let Some(blast) = all.iter_mut().find(|b| joins(b, &dimension, center)) {
-                blast.yield_tnt += added;
+                blast.yield_tnt = (blast.yield_tnt + added).min(MAX_YIELD);
                 blast.size = visual_size(blast.yield_tnt);
                 blast.big = blast.big || blast.yield_tnt > BIG_YIELD;
-                event.blocks.clear();
+                // Within the crater the blast digs, it does the breaking; elsewhere (beside a blast
+                // too small to dig one, or past its edge) this explosion breaks blocks as usual.
+                if digs_over(blast, center) {
+                    event.blocks.clear();
+                }
                 return;
             }
         }
@@ -508,6 +836,23 @@ impl Hooks for Mod {
         if big {
             // It digs its own crater as its front passes.
             event.blocks.clear();
+        } else {
+            // A block of greater worth it reaches past the mass goes off a moment later as what it
+            // is worth, as vanilla's TNT caught in a blast does (vanilla would light it as one TNT).
+            let valued: Vec<([i32; 3], String, u64)> = event
+                .blocks
+                .iter()
+                .filter_map(|&pos| {
+                    let name = block_at(&*host, level, pos);
+                    tnt_worth(&name).filter(|&worth| worth > 1).map(|worth| (pos, name, worth))
+                })
+                .collect();
+            if !valued.is_empty() {
+                event.blocks.retain(|pos| !valued.iter().any(|(at, _, _)| at == pos));
+                for (pos, name, worth) in valued {
+                    let _ = light(host, level, &dimension, pos, &name, worth, 10 + (mix(pos, 3) % 20) as i32, true);
+                }
+            }
         }
         let power = reach(center, event.blocks).max((crater_radius(added) * 0.6) as f32);
         let size = visual_size(added);
@@ -628,48 +973,31 @@ impl Hooks for Mod {
         let Some(level) = host.level(&dimension) else {
             return Flow::Continue;
         };
-        // TNT lit in a mass that is already burning (a signal reaching several blocks of it, fire
-        // spreading over it, a second one lit) goes off with it, when it does: the mass's fuse
-        // gives it its own fuse on the next ticks (`follow_fuses`), without walking the mass again.
-        if let Some(burning) = burning_mass_of(&mut fuses(), &dimension, cell) {
-            burning.sweep = FIND_TICKS;
-            return Flow::Continue;
-        }
-        let cluster = {
-            let look = |pos| block_at(&*host, level, pos);
-            tnt_cluster(&look, cell, config::get().max_fold)
-        };
-        let mass = mass_of(&cluster, cell);
-        let total = fuse_ticks(mass as f32);
-        if total <= FUSE_TICKS {
-            return Flow::Continue;
-        }
-        let mut all = fuses();
-        // A burning mass this one's reaches (TNT laid next to it since it was lit) takes it in.
-        let burning = all.iter().any(|f| f.dimension == dimension && f.gone.is_none());
-        let cells: HashSet<[i32; 3]> = if burning {
-            cluster.iter().copied().collect()
-        } else {
-            HashSet::new()
-        };
-        let reached = all
-            .iter_mut()
-            .filter(|f| f.dimension == dimension && f.gone.is_none())
-            .filter(|f| same_mass(&cells, cell, f.pos))
-            .min_by_key(|f| f.left);
-        if let Some(burning) = reached {
-            burning.sweep = FIND_TICKS;
-            burning.cells.extend(cluster.iter().copied());
-            let (lo, hi) = bounds_of(&cluster, cell);
-            for axis in 0..3 {
-                burning.lo[axis] = burning.lo[axis].min(lo[axis]);
-                burning.hi[axis] = burning.hi[axis].max(hi[axis]);
-            }
-            return Flow::Continue;
-        }
-        let fuse = new_fuse(&dimension, cell, &cluster, total);
-        add_fuse(&mut all, fuse);
+        follow_lit(host, level, &dimension, cell, 1);
         Flow::Continue
+    }
+
+    fn living_incoming_damage(&self, _level: &mut dyn LevelRandomHost, event: &mut LivingIncomingDamageEvent<'_>) -> Flow {
+        // Big blasts deal their own shockwave damage (`shockwave`); cancel vanilla's Tick-0
+        // 1-TNT explosion hit so nearby mobs do not trigger i-frames or teleport away first.
+        if IN_SHOCKWAVE.with(|flag| flag.get()) {
+            return Flow::Continue;
+        }
+        if !matches!(event.source.damage_type, "minecraft:explosion" | "minecraft:player_explosion") {
+            return Flow::Continue;
+        }
+        let pos = event.source.position;
+        let victim = event.victim.position;
+        let matches_blast = |center: [f64; 3]| {
+            pos.is_some_and(|p| distance(center, p) <= 2.0) || distance(center, victim) <= 10.0
+        };
+        let cancel = blasts().iter().any(|b| b.big && b.ticks == 0 && matches_blast(b.center))
+            || last_start().as_ref().is_some_and(|(_, center, yield_tnt)| *yield_tnt > BIG_YIELD && matches_blast(*center));
+        if cancel {
+            Flow::Cancel
+        } else {
+            Flow::Continue
+        }
     }
 
     fn explosion_knockback(&self, _host: &mut dyn ServerHost, event: &mut ExplosionKnockbackEvent<'_>) {
@@ -678,28 +1006,45 @@ impl Hooks for Mod {
             *event.knockback_velocity = [0.0; 3];
             return;
         }
-        // The blast this explosion is part of pushes as hard as its yield.
-        let yield_tnt = blasts()
+        // Big blasts apply their own yield-scaled shockwave push right after damaging mobs.
+        let matched = blasts()
             .iter()
             .filter(|b| b.dimension == event.dimension && b.ticks <= MERGE_TICKS)
             .find(|b| distance(b.center, event.center) <= crater_radius(b.yield_tnt) + 6.0)
-            .map_or(1.0, |b| b.yield_tnt);
+            .map(|b| (b.yield_tnt, b.big))
+            .or_else(|| {
+                last_start()
+                    .as_ref()
+                    .filter(|(dim, at, _)| *dim == event.dimension && distance(*at, event.center) <= 2.0)
+                    .map(|&(_, _, y)| (y, y > BIG_YIELD))
+            });
+        if matched.is_some_and(|(_, big)| big) {
+            *event.knockback_velocity = [0.0; 3];
+            return;
+        }
+        // Small blasts push as hard as their yield.
+        let yield_tnt = matched.map_or(1.0, |(y, _)| y);
         let factor = config::get().knockback * f64::from(yield_tnt.max(1.0)).cbrt();
         for axis in event.knockback_velocity.iter_mut() {
             *axis = (*axis * factor).clamp(-3.9, 3.9);
         }
     }
-
     fn level_unload(&self, _host: &mut dyn ServerHost, event: &mut LevelUnloadEvent<'_>) {
         // Its chunks go with it, and the fuses burning in it are no longer followed.
         fuses().retain(|f| f.dimension != event.dimension);
         releases().retain(|r| r.dimension != event.dimension);
+        to_light().retain(|l| l.dimension != event.dimension);
+        check_signal().retain(|(dim, _)| dim != event.dimension);
+        lit_worth(|all| all.retain(|_, entry| entry.dimension != event.dimension));
     }
 
     fn server_stopping(&self, _host: &mut dyn ServerHost, _event: &mut ServerStoppingEvent) {
         // The server lets go of every chunk held as it stops; the next world starts afresh.
         fuses().clear();
         releases().clear();
+        to_light().clear();
+        check_signal().clear();
+        lit_worth(|all| all.clear());
         *counted() = None;
     }
 
@@ -714,6 +1059,8 @@ impl Hooks for Mod {
         if tps.is_finite() && tps > 0.0 {
             SERVER_TPS.store(tps.to_bits(), Ordering::Relaxed);
         }
+        refresh_lit_worth(host, &dimension);
+        light_queued(host, level, &dimension);
         follow_fuses(host, level, &dimension);
         countdown(host, level, &dimension);
         // Take this tick's work out while holding the lock; do it after, with the lock released
@@ -760,7 +1107,7 @@ impl Hooks for Mod {
                 let rim_to = radius * destruction::RIM_REACH;
                 let rim = (blast.big && blast.rimmed < rim_to)
                     .then(|| {
-                        let from = blast.rimmed.max(radius * 0.95);
+                        let from = blast.rimmed.max(radius * destruction::RIM_START);
                         let to = capped_ring(from, front.min(dug).min(rim_to), CARVE_PER_TICK);
                         blast.rimmed = to;
                         (from, to)
@@ -916,12 +1263,41 @@ impl Hooks for Mod {
         }
         for (center, size) in heard {
             let dist = distance(at, center) as f32;
-            for cue in boom(dist, size) {
+            let cues = boom(dist, size);
+            destruction::debug(format_args!(
+                "heard {dist:.1} blocks off (size {size:.1}, reach {:.0}): {:?}",
+                shock_range(size),
+                cues.iter().map(|c| (c.sound, c.delay)).collect::<Vec<_>>()
+            ));
+            for cue in cues {
                 let mut sound = SoundPlay::at(cue.sound, SoundSource::Blocks, center);
                 sound.volume = cue.volume;
                 sound.pitch = cue.pitch;
                 sound.attenuation = SoundAttenuation::Linear;
+                if cue.inside {
+                    sound.relative = true;
+                    sound.position = [0.0; 3];
+                    sound.attenuation = SoundAttenuation::None;
+                }
                 host.play_local_sound(&sound, cue.delay.max(0) as u32);
+            }
+            // Close by, the world sounds muffled from when the shockwave arrives, while the ears
+            // ring.
+            if let Some(loud) = ringing(dist, size) {
+                let arrives = sound_delay(dist, size) as f32 / 20.0;
+                let next = Muffle {
+                    from: now + std::time::Duration::from_secs_f32(arrives),
+                    secs: 3.0 + 5.0 * loud,
+                    depth: (loud * 0.9).min(0.75),
+                };
+                let mut current = muffle();
+                // A deeper muffle wins over a fading one.
+                let keep = current.is_some_and(|m| {
+                    muffled(&m, now.saturating_duration_since(m.from).as_secs_f32()) < 1.0 - next.depth
+                });
+                if !keep {
+                    *current = Some(next);
+                }
             }
         }
     }
@@ -952,7 +1328,18 @@ impl Hooks for Mod {
         // boom when the shockwave arrives. Both together sound like the same blast twice, so the
         // vanilla one is dropped where the mod has a blast of its own.
         let sound = event.original;
-        if !event.starting || sound.identifier != "minecraft:entity.generic.explode" {
+        if !event.starting {
+            return;
+        }
+        // While the ears ring after a blast close by, everything else sounds muffled.
+        if !sound.identifier.starts_with("realistic_tnt:")
+            && let Some(m) = *muffle()
+            && let Some(playing) = event.sound.as_mut()
+            && let Some(since) = Instant::now().checked_duration_since(m.from)
+        {
+            playing.volume *= muffled(&m, since.as_secs_f32());
+        }
+        if sound.identifier != "minecraft:entity.generic.explode" {
             return;
         }
         let now = Instant::now();
@@ -988,6 +1375,190 @@ impl Hooks for Mod {
             event.params[slot] = value;
         }
     }
+}
+
+/// TNT just lit at `cell` (worth `lit` TNT) in a mass burns longer, the bigger the mass: time to
+/// get out of its reach. The lit TNT is found and its fuse stretched on the level's next tick
+/// (`follow_fuses`), and the chunks round it are held so that it burns however far away the
+/// players go.
+fn follow_lit(host: &mut dyn ServerHost, level: LevelRef, dimension: &str, cell: [i32; 3], lit: u64) {
+    follow_lit_inner(host, level, dimension, cell, lit, None, None);
+}
+
+/// Tracks a TNT lit by the remote detonator at `cell` with a fixed `fixed_fuse` (100 ticks),
+/// keeping that fuse even when the mass would normally stretch or was already stretched.
+fn follow_lit_fixed(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    dimension: &str,
+    cell: [i32; 3],
+    lit: u64,
+    fixed_fuse: i32,
+    entity_id: u32,
+) {
+    follow_lit_inner(host, level, dimension, cell, lit, Some(fixed_fuse), Some(entity_id));
+}
+
+fn follow_lit_inner(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    dimension: &str,
+    cell: [i32; 3],
+    lit: u64,
+    fixed_fuse: Option<i32>,
+    entity_id: Option<u32>,
+) {
+    // TNT lit in a mass that is already burning (a signal reaching several blocks of it, fire
+    // spreading over it, a second one lit) goes off with it, when it does: the mass's fuse gives it
+    // its own fuse on the next ticks (`follow_fuses`), without walking the mass again.
+    let existing_to_clamp = {
+        let mut all = fuses();
+        if let Some(burning) = burning_mass_of(&mut all, dimension, cell) {
+            burning.sweep = FIND_TICKS;
+            if let Some(ticks) = fixed_fuse
+                && burning.left > ticks
+            {
+                burning.total = ticks;
+                burning.left = ticks;
+                Some(burning.entity)
+            } else {
+                return;
+            }
+        } else {
+            None
+        }
+    };
+    if let Some(maybe_entity) = existing_to_clamp {
+        if let (Some(ticks), Some(existing_id)) = (fixed_fuse, maybe_entity) {
+            set_fuse(host, existing_id, ticks);
+        }
+        return;
+    }
+    let (cluster, worth) = {
+        let look = |pos| block_at(&*host, level, pos);
+        tnt_cluster(&look, cell, config::get().max_fold)
+    };
+    let mass = mass_of(&cluster, worth, cell, lit);
+    let total = match fixed_fuse {
+        Some(ticks) => ticks,
+        None => {
+            let stretched = fuse_ticks(mass as f32);
+            if stretched <= FUSE_TICKS {
+                return;
+            }
+            stretched
+        }
+    };
+    let clamp_reached = {
+        let mut all = fuses();
+        // A burning mass this one's reaches (TNT laid next to it since it was lit) takes it in.
+        let burning = all.iter().any(|f| f.dimension == dimension && f.gone.is_none());
+        let cells: HashSet<[i32; 3]> = if burning {
+            cluster.iter().copied().collect()
+        } else {
+            HashSet::new()
+        };
+        let reached = all
+            .iter_mut()
+            .filter(|f| f.dimension == dimension && f.gone.is_none())
+            .filter(|f| same_mass(&cells, cell, f.pos))
+            .min_by_key(|f| f.left);
+        if let Some(burning) = reached {
+            burning.sweep = FIND_TICKS;
+            burning.cells.extend(cluster.iter().copied());
+            let (lo, hi) = bounds_of(&cluster, cell);
+            for axis in 0..3 {
+                burning.lo[axis] = burning.lo[axis].min(lo[axis]);
+                burning.hi[axis] = burning.hi[axis].max(hi[axis]);
+            }
+            if let Some(ticks) = fixed_fuse
+                && burning.left > ticks
+            {
+                burning.total = ticks;
+                burning.left = ticks;
+                burning.entity
+            } else {
+                return;
+            }
+        } else {
+            let mut fuse = new_fuse(dimension, cell, &cluster, mass, total);
+            if let Some(id) = entity_id {
+                fuse.entity = Some(id);
+            }
+            add_fuse(&mut all, fuse);
+            return;
+        }
+    };
+    if let (Some(ticks), Some(existing_id)) = (fixed_fuse, clamp_reached) {
+        set_fuse(host, existing_id, ticks);
+    }
+}
+
+/// Lights the TNT block `name` at `cell`, worth `worth` TNT, as TNT is lit: the block goes (when
+/// `take`) and a primed TNT that looks like it burns `fuse` ticks in its place, hissing. Its
+/// explosion is as big as it is worth (`LIT_WORTH`, read by `explosion_start`). Returns the entity
+/// id if it was lit; if the game refuses the primed TNT, the block is put back.
+#[allow(clippy::too_many_arguments)]
+fn light(host: &mut dyn ServerHost, level: LevelRef, dimension: &str, cell: [i32; 3], name: &str, worth: u64, fuse: i32, take: bool) -> Option<u32> {
+    let (Some(air), Some(was)) = (state_of(&*host, "minecraft:air"), state_of(&*host, name)) else {
+        return None;
+    };
+    if take && !set_block(host, level, cell, air) {
+        return None;
+    }
+    let mut nbt = Compound::new();
+    nbt.insert("fuse".into(), Tag::Short(fuse.clamp(1, i32::from(i16::MAX)) as i16));
+    // The primed TNT is drawn as the block it was.
+    nbt.insert("block_state".into(), Tag::String(name.into()));
+    let at = [f64::from(cell[0]) + 0.5, f64::from(cell[1]), f64::from(cell[2]) + 0.5];
+    let fuse = fuse.clamp(1, i32::from(i16::MAX));
+    let summoned = host.summon("minecraft:tnt", dimension, at, nbt).or_else(|| {
+        // Where the game's summon call refuses it, `/summon` takes it, and the new TNT is the one
+        // standing there that no other lighting has claimed.
+        let [x, y, z] = at;
+        let line = format!("execute in {dimension} run summon minecraft:tnt {x} {y} {z} {{fuse:{fuse}s,block_state:\"{name}\"}}");
+        if !host.commands().run_command(&line) {
+            return None;
+        }
+        let claimed: HashSet<u32> = lit_worth(|all| all.keys().copied().collect());
+        level
+            .entities_in(&*host, [x - 0.6, y - 0.1, z - 0.6], [x + 0.6, y + 1.1, z + 0.6])
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|e| !claimed.contains(&e.id()))
+            .find(|&e| kind_of(&*host, e).as_deref() == Some("minecraft:tnt") && live_fuse(host, e.id()) == Some(fuse))
+            .map(|e| e.id())
+    });
+    let Some(id) = summoned else {
+        destruction::debug(format_args!("light {name} at {cell:?}: the game refused the primed TNT"));
+        if take {
+            RESTORING_VALUED_TNT.with(|flag| flag.set(true));
+            set_block(host, level, cell, was);
+            RESTORING_VALUED_TNT.with(|flag| flag.set(false));
+        }
+        return None;
+    };
+    destruction::debug(format_args!("light {name} at {cell:?}: primed TNT {id}, worth {worth}"));
+    lit_worth(|all| {
+        // A primed TNT that never went off (a mod took it away) is not kept for ever.
+        if all.len() > 4096 {
+            all.clear();
+        }
+        all.insert(
+            id,
+            LitWorth {
+                worth,
+                pos: at,
+                dimension: dimension.to_owned(),
+                gone: false,
+            },
+        );
+    });
+    let [x, y, z] = at;
+    let _ = host
+        .commands()
+        .run_command(&format!("execute in {dimension} run playsound minecraft:entity.tnt.primed block @a {x} {y} {z} 1 1"));
+    Some(id)
 }
 
 /// The block at `pos` of `level`, by name (`minecraft:tnt`); empty where it can't be read.
@@ -1254,40 +1825,180 @@ fn slots(shown: &[Shown]) -> [[f32; 4]; WAVE_SLOTS * 2] {
 }
 
 /// A sound the window plays for a blast.
+#[derive(Debug)]
 struct Cue {
     sound: &'static str,
+    /// Past 1 it carries farther, not louder: it fades out to 16 blocks times it (`Linear`). For a
+    /// sound in the head (`inside`), how loud it is.
     volume: f32,
     pitch: f32,
     /// Ticks from now.
     delay: i32,
+    /// Heard in the listener's own head (the ears ringing), not from the blast.
+    inside: bool,
 }
 
-/// The sounds of a blast `dist` blocks away, timed to its shockwave: a deep boom and a thump as it
-/// arrives, and thunder rolling after it. A volume past 1 carries farther (16 blocks times it).
-fn boom(dist: f32, size: f32) -> [Cue; 3] {
-    let delay = sound_delay(dist, size);
-    // A bigger blast is heard farther, and deeper.
-    let deep = 1.0 / time_scale(size).sqrt();
-    [
-        Cue {
-            sound: "minecraft:entity.generic.explode",
-            volume: (size * 1.3).clamp(4.0, 600.0),
-            pitch: BOOM_PITCH * deep.max(0.6),
-            delay,
-        },
-        Cue {
-            sound: "minecraft:entity.warden.sonic_boom",
-            volume: (size * 0.7).clamp(2.0, 300.0),
-            pitch: 0.6 * deep.max(0.6),
-            delay,
-        },
-        Cue {
-            sound: "minecraft:entity.lightning_bolt.thunder",
-            volume: size.clamp(3.0, 400.0),
-            pitch: 0.55 * deep.max(0.6),
-            delay: (delay + 4).min(1200),
-        },
-    ]
+/// How far out, in shockwave reaches (`shock_range`), each part of a blast is heard: its roar and
+/// the shaking ground near it, its crack and falling debris close by, its boom and rumble far off.
+/// A real one is heard tens of times farther than it harms (Beirut's, 240 km off, in Cyprus).
+const FLASH_HEARD: f32 = 3.0;
+const GROUND_HEARD: f32 = 4.0;
+const CRACK_HEARD: f32 = 1.2;
+const BOOM_HEARD: f32 = 6.0;
+const DEBRIS_HEARD: f32 = 1.0;
+/// Within this many reaches the boom keeps its crack and grit (`blast.boom_large` and the rest of its tier); farther, the
+/// air has taken its high pitches and it is a dull thud (`blast.boom_far`).
+const NEAR_BOOM: f32 = 0.8;
+/// Within this many reaches the ears ring after it, and the world sounds muffled for a while
+/// (`muffled`).
+const RINGING: f32 = 0.4;
+/// The ground carries a blast's shaking this many times as fast as the air carries its sound.
+const GROUND_SPEEDUP: i32 = 5;
+
+/// The sounds of a blast `dist` blocks away, as a real one is heard (`tools/make_sounds.py` makes
+/// them): the fireball's roar at once, with the flash; the ground shaking ahead of the air wave;
+/// then, as the shockwave arrives, its crack close by and the boom, heavy near and a dull thud far
+/// off; the boom rolling on; debris raining down; and close by, the ears ringing.
+fn boom(dist: f32, size: f32) -> Vec<Cue> {
+    let air = sound_delay(dist, size);
+    let range = shock_range(size);
+    let (tier, within) = SoundTier::of(yield_of_size(size));
+    // Within its tier a bigger blast is a little deeper (its sounds played slower), so that the
+    // sound grows step by step from one TNT to a nuclear-sized blast.
+    let pitch = (1.1 - 0.25 * within).clamp(0.5, 2.0);
+    let reach = |reaches: f32| (range * reaches / 16.0).max(1.0);
+    let at = |delay: i32| delay.clamp(0, 1200);
+    let mut cues = Vec::new();
+    let mut cue = |sound, volume, pitch: f32, delay| {
+        cues.push(Cue { sound, volume, pitch: pitch.clamp(0.5, 2.0), delay: at(delay), inside: false });
+    };
+    if dist < range * FLASH_HEARD {
+        let flash = match tier {
+            SoundTier::Small => "realistic_tnt:blast.flash_small",
+            SoundTier::Huge => "realistic_tnt:blast.flash_huge",
+            _ => "realistic_tnt:blast.flash",
+        };
+        cue(flash, reach(FLASH_HEARD), pitch, 0);
+    }
+    // One TNT doesn't shake the ground far enough to hear it before its boom.
+    if tier != SoundTier::Small && dist < range * GROUND_HEARD {
+        cue("realistic_tnt:blast.ground", reach(GROUND_HEARD), pitch * tier.depth(), air / GROUND_SPEEDUP);
+    }
+    if dist < range * CRACK_HEARD {
+        cue("realistic_tnt:blast.crack", reach(CRACK_HEARD), pitch, air);
+    }
+    let boom = if dist >= range * NEAR_BOOM {
+        "realistic_tnt:blast.boom_far"
+    } else {
+        match tier {
+            SoundTier::Small => "realistic_tnt:blast.boom_small",
+            SoundTier::Medium => "realistic_tnt:blast.boom_medium",
+            SoundTier::Large => "realistic_tnt:blast.boom_large",
+            SoundTier::Huge => "realistic_tnt:blast.boom_huge",
+        }
+    };
+    let far_pitch = if dist >= range * NEAR_BOOM { tier.depth() } else { 1.0 };
+    cue(boom, reach(BOOM_HEARD), pitch * far_pitch, air);
+    // A lone TNT's boom has its own short tail.
+    match tier {
+        SoundTier::Small => {}
+        SoundTier::Huge => cue("realistic_tnt:blast.rumble_huge", reach(BOOM_HEARD), pitch, air + 8),
+        _ => cue("realistic_tnt:blast.rumble", reach(BOOM_HEARD), pitch * tier.depth(), air + 6),
+    }
+    // A nuclear-sized blast's wind, rushing out and back in toward its fireball.
+    if tier == SoundTier::Huge && dist < range * WIND_HEARD {
+        cue("realistic_tnt:blast.wind", reach(WIND_HEARD), pitch, air + 20);
+    }
+    if dist < range * DEBRIS_HEARD {
+        cue("realistic_tnt:blast.debris", reach(DEBRIS_HEARD), 1.0, air + 18);
+    }
+    if let Some(loud) = ringing(dist, size) {
+        cues.push(Cue {
+            sound: "realistic_tnt:blast.ringing",
+            volume: loud,
+            pitch: 1.0,
+            delay: at(air + 2),
+            inside: true,
+        });
+    }
+    cues
+}
+
+/// How far out, in reaches, a nuclear-sized blast's wind is heard.
+const WIND_HEARD: f32 = 2.0;
+
+/// Which set of sounds a blast plays, by its yield in TNT: one TNT's quality bang, tens of TNT's
+/// heavier boom, hundreds' and thousands' (Beirut's kind), and a nuclear-sized blast's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SoundTier {
+    Small,
+    Medium,
+    Large,
+    Huge,
+}
+
+impl SoundTier {
+    /// Where each tier starts, in TNT; the last runs on with no end.
+    const FROM: [f32; 4] = [0.0, 4.0, 64.0, 4096.0];
+    /// How far the next tier's start is, past the last.
+    const LAST_SPAN: f32 = 64.0;
+
+    /// The tier of a blast of `yield_tnt`, and how far into it (0 to 1, by the log of the yield).
+    fn of(yield_tnt: f32) -> (Self, f32) {
+        let y = yield_tnt.max(1.0);
+        let tiers = [SoundTier::Small, SoundTier::Medium, SoundTier::Large, SoundTier::Huge];
+        let i = Self::FROM.iter().rposition(|&from| y >= from).unwrap_or(0);
+        let from = Self::FROM[i].max(1.0);
+        let to = Self::FROM.get(i + 1).copied().unwrap_or(from * Self::LAST_SPAN);
+        (tiers[i], ((y / from).ln() / (to / from).ln()).clamp(0.0, 1.0))
+    }
+
+    /// How much deeper its shared sounds (the far boom, the ground, the rumble) play than one TNT's.
+    fn depth(self) -> f32 {
+        match self {
+            SoundTier::Small => 1.25,
+            SoundTier::Medium => 1.05,
+            SoundTier::Large => 0.85,
+            SoundTier::Huge => 0.62,
+        }
+    }
+}
+
+/// The yield in TNT of a blast the pack draws `size` blocks big (`visual_size` turned round).
+fn yield_of_size(size: f32) -> f32 {
+    (size / BASE_SIZE).powi(3)
+}
+
+/// How loud (0 to 1) a blast of `size` `dist` blocks away leaves the ears ringing: none past
+/// `RINGING` reaches, the loudest at the blast.
+fn ringing(dist: f32, size: f32) -> Option<f32> {
+    let near = 1.0 - dist / (shock_range(size) * RINGING);
+    (near > 0.0).then_some(0.15 + 0.6 * near)
+}
+
+/// After a blast close by the world sounds muffled while the ears ring: from when its shockwave
+/// arrives, the other sounds are this much quieter at first (`depth`, 0 to 1), less and less
+/// over `secs`.
+#[derive(Clone, Copy, Debug)]
+struct Muffle {
+    from: Instant,
+    secs: f32,
+    depth: f32,
+}
+
+static MUFFLE: Mutex<Option<Muffle>> = Mutex::new(None);
+
+fn muffle() -> std::sync::MutexGuard<'static, Option<Muffle>> {
+    MUFFLE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// What a sound's volume is multiplied by `since` seconds after `muffle` began: 1 before it and
+/// once it is over.
+fn muffled(muffle: &Muffle, since: f32) -> f32 {
+    if !(0.0..muffle.secs).contains(&since) {
+        return 1.0;
+    }
+    1.0 - muffle.depth * (1.0 - since / muffle.secs).powi(2)
 }
 
 /// How many ticks the shockwave of a blast of `size` takes to go `dist` blocks.
@@ -1506,25 +2217,36 @@ fn joins(blast: &Blast, dimension: &str, center: [f64; 3]) -> bool {
         && distance(blast.center, center) <= crater_radius(blast.yield_tnt) + 6.0
 }
 
+/// Whether `blast`'s own crater takes in an explosion at `center` that joined it: a blast that
+/// digs one, with `center` well inside its edge.
+fn digs_over(blast: &Blast, center: [f64; 3]) -> bool {
+    blast.big && distance(blast.center, center) <= crater_radius(blast.yield_tnt) * 0.85
+}
+
 /// The TNT blocks of the mass an explosion in block `cell` sets off: those within two blocks of it,
 /// and every TNT block within two blocks of those (so TNT laid with a block of space between still
-/// counts as one mass), at most `cap` of them.
-fn tnt_cluster(look: &dyn Fn([i32; 3]) -> String, cell: [i32; 3], cap: usize) -> Vec<[i32; 3]> {
+/// counts as one mass), at most `cap` of them; and what they are worth in all (`tnt_worth`: this
+/// mod's blocks of greater worth count as much as they are worth).
+fn tnt_cluster(look: &dyn Fn([i32; 3]) -> String, cell: [i32; 3], cap: usize) -> (Vec<[i32; 3]>, u64) {
     let mut seen = HashSet::new();
     let mut queue = VecDeque::new();
     for dx in -2..=2 {
         for dy in -2..=2 {
             for dz in -2..=2 {
                 let pos = [cell[0] + dx, cell[1] + dy, cell[2] + dz];
-                if seen.insert(pos) && look(pos) == "minecraft:tnt" {
-                    queue.push_back(pos);
+                if seen.insert(pos)
+                    && let Some(worth) = tnt_worth(&look(pos))
+                {
+                    queue.push_back((pos, worth));
                 }
             }
         }
     }
     let mut found = Vec::new();
-    while let Some(pos) = queue.pop_front() {
+    let mut total = 0u64;
+    while let Some((pos, worth)) = queue.pop_front() {
         found.push(pos);
+        total = total.saturating_add(worth);
         if found.len() >= cap {
             break;
         }
@@ -1532,14 +2254,16 @@ fn tnt_cluster(look: &dyn Fn([i32; 3]) -> String, cell: [i32; 3], cap: usize) ->
             for dy in -2..=2 {
                 for dz in -2..=2 {
                     let next = [pos[0] + dx, pos[1] + dy, pos[2] + dz];
-                    if seen.insert(next) && look(next) == "minecraft:tnt" {
-                        queue.push_back(next);
+                    if seen.insert(next)
+                        && let Some(worth) = tnt_worth(&look(next))
+                    {
+                        queue.push_back((next, worth));
                     }
                 }
             }
         }
     }
-    found
+    (found, total)
 }
 
 /// Takes `blocks` out of the world at once, telling no neighbour (TNT taken into a blast must not
@@ -1570,13 +2294,15 @@ fn remove_blocks(host: &mut dyn ServerHost, dimension: &str, blocks: &[[i32; 3]]
 /// How many TNT a block lit at `cell` sets off: the mass round it (`tnt_cluster`, as its explosion
 /// will take it in), itself included when fire or a signal has already taken it out of the world.
 #[cfg(test)]
-fn tnt_mass(look: &dyn Fn([i32; 3]) -> String, cell: [i32; 3]) -> usize {
-    mass_of(&tnt_cluster(look, cell, MAX_FOLD), cell)
+fn tnt_mass(look: &dyn Fn([i32; 3]) -> String, cell: [i32; 3]) -> u64 {
+    let (cluster, worth) = tnt_cluster(look, cell, MAX_FOLD);
+    mass_of(&cluster, worth, cell, 1)
 }
 
-/// `tnt_mass` of a mass already walked (`tnt_cluster`).
-fn mass_of(cluster: &[[i32; 3]], cell: [i32; 3]) -> usize {
-    if cluster.contains(&cell) { cluster.len() } else { cluster.len() + 1 }
+/// `tnt_mass` of a mass already walked (`tnt_cluster`, worth `worth`), the lit block at `cell`
+/// being worth `lit` when it is no longer in it.
+fn mass_of(cluster: &[[i32; 3]], worth: u64, cell: [i32; 3], lit: u64) -> u64 {
+    if cluster.contains(&cell) { worth } else { worth.saturating_add(lit) }
 }
 
 /// Whether TNT lit at `cell`, whose mass is `cells`, belongs to the same mass as TNT lit earlier at
@@ -1595,7 +2321,7 @@ fn same_mass(cells: &HashSet<[i32; 3]>, cell: [i32; 3], pos: [i32; 3]) -> bool {
 /// in `cluster` burns and its crater is dug: the 3 by 3 round the TNT first, then those of the
 /// mass and the ring round them, then a disc out to the scorched land round the crater, at most
 /// `HOLD_CHUNKS` chunks out (a bigger crater is dug where its chunks are loaded).
-fn hold_area(cell: [i32; 3], cluster: &[[i32; 3]], mass: usize) -> Vec<[i32; 2]> {
+fn hold_area(cell: [i32; 3], cluster: &[[i32; 3]], mass: u64) -> Vec<[i32; 2]> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     let mut add = |chunk: [i32; 2], out: &mut Vec<[i32; 2]>| {
@@ -1622,12 +2348,13 @@ fn hold_area(cell: [i32; 3], cluster: &[[i32; 3]], mass: usize) -> Vec<[i32; 2]>
             }
         }
     }
-    let lifted = if mass as f32 >= config::get().lift_yield {
-        lift_reach(mass as f32, visual_size(mass as f32))
-    } else {
-        0.0
-    };
-    let reach = (crater_radius(mass as f32) * 1.7).max(lifted) + 16.0;
+    let yield_tnt = (mass as f32).min(MAX_YIELD);
+    let size = visual_size(yield_tnt);
+    let reach = (crater_radius(yield_tnt) * 1.7)
+        .max(crater_radius(yield_tnt) * destruction::RIM_REACH)
+        .max(lifts_to(yield_tnt, size))
+        .max(fires_to(yield_tnt, size))
+        + 16.0;
     let r = ((reach / 16.0).ceil() as i32).clamp(1, config::get().hold_chunks);
     for dx in -r..=r {
         for dz in -r..=r {
@@ -1667,7 +2394,7 @@ fn live_fuse(host: &mut dyn ServerHost, id: u32) -> Option<i32> {
 /// to fly out of its shockwave's reach at `ESCAPE_SPEED`. One TNT keeps vanilla's fuse. A fuse is
 /// a short in the TNT's data, which caps it at about 27 minutes.
 fn fuse_ticks(yield_tnt: f32) -> i32 {
-    let farther = (shock_range(visual_size(yield_tnt)) - shock_range(BASE_SIZE)).max(0.0);
+    let farther = (shock_range(visual_size(yield_tnt.min(MAX_YIELD))) - shock_range(BASE_SIZE)).max(0.0);
     let ticks = FUSE_TICKS as f32 + farther / config::get().escape_speed * 20.0;
     ticks.min(f32::from(i16::MAX)).round() as i32
 }
@@ -1896,19 +2623,55 @@ fn followed_tnt() -> HashSet<u32> {
         .collect()
 }
 
-/// The big blasts of `dimension` still digging their crater or scorching the land round it: where,
+/// The big blasts of `dimension` still changing the land round them (`still_digging`): where,
 /// and how far out the chunks they dig reach.
 fn digging_blasts(dimension: &str) -> Vec<([f64; 3], f64)> {
     blasts()
         .iter()
         .filter(|b| b.dimension == dimension && b.big)
-        .filter_map(|b| {
-            let radius = crater_radius(b.yield_tnt);
-            let lifted = if b.yield_tnt >= config::get().lift_yield { lift_reach(b.yield_tnt, b.size) } else { 0.0 };
-            (b.carved < radius * 1.1 || b.scorched < radius * 1.7 || b.lifted < lifted)
-                .then_some((b.center, (radius * 1.7).max(lifted) + 16.0))
-        })
+        .filter_map(still_digging)
         .collect()
+}
+
+/// Where a big blast is still changing the land (its crater, the scorched ground, the land torn up,
+/// its rim, its fires, its walls sliding in, its debris coming down) and how far out from its
+/// centre, past which nothing of it needs holding; none once it is all done.
+fn still_digging(b: &Blast) -> Option<([f64; 3], f64)> {
+    let radius = crater_radius(b.yield_tnt);
+    let scorched = if config::get().scorch { radius * 1.7 } else { 0.0 };
+    let lifted = lifts_to(b.yield_tnt, b.size);
+    let fired = fires_to(b.yield_tnt, b.size);
+    let rimmed = radius * destruction::RIM_REACH;
+    let dug = b.carved >= radius * 1.1;
+    let slumping = radius >= 6.0 && b.slumped < destruction::slump_ticks(radius);
+    let landing = b
+        .impacts
+        .iter()
+        .map(|i| ((i.at[0] - b.center[0]).powi(2) + (i.at[2] - b.center[2]).powi(2)).sqrt() + i.radius)
+        .fold(0.0, f64::max);
+    let busy = !dug
+        || slumping
+        || !b.impacts.is_empty()
+        || b.scorched < scorched
+        || b.lifted < lifted
+        || b.rimmed < rimmed
+        || b.fired < fired;
+    busy.then_some((b.center, rimmed.max(scorched).max(lifted).max(fired).max(landing) + 16.0))
+}
+
+/// How far out a big blast of `yield_tnt` and `size` tears up the land (`lift`), 0 if it doesn't.
+fn lifts_to(yield_tnt: f32, size: f32) -> f64 {
+    if yield_tnt >= config::get().lift_yield { lift_reach(yield_tnt, size) } else { 0.0 }
+}
+
+/// How far out a big blast of `yield_tnt` and `size` lights fires (`destruction::ignite`), 0 if it
+/// doesn't.
+fn fires_to(yield_tnt: f32, size: f32) -> f64 {
+    if config::get().fire && yield_tnt >= destruction::FIRE_YIELD {
+        destruction::fire_reach(yield_tnt, size)
+    } else {
+        0.0
+    }
 }
 
 fn digging_near(digging: &[([f64; 3], f64)], pos: [i32; 3]) -> bool {
@@ -1946,7 +2709,7 @@ fn countdown(host: &mut dyn ServerHost, level: LevelRef, dimension: &str) {
                     f.dimension == dimension && f.entity.is_some() && f.gone.is_none() && f.left > 0
                 })
                 .filter(|f| {
-                    let reach = f64::from(shock_range(visual_size(f.mass as f32)));
+                    let reach = f64::from(shock_range(visual_size((f.mass as f32).min(MAX_YIELD))));
                     distance(at, center_of(f.pos)) <= reach * 4.0 + COUNTDOWN_MARGIN
                 })
                 .max_by_key(|f| (f.mass, std::cmp::Reverse(f.left)))
@@ -1994,8 +2757,8 @@ fn colored(text: String, color: &str) -> Text {
 
 /// What the bar says as a mass of `mass` TNT goes off `dist` blocks away: when its shockwave gets
 /// here (it runs at `shock_speed`), or that it won't.
-fn went_off_text(mass: usize, dist: f64) -> String {
-    let size = visual_size(mass as f32);
+fn went_off_text(mass: u64, dist: f64) -> String {
+    let size = visual_size((mass as f32).min(MAX_YIELD));
     let reach = f64::from(shock_range(size));
     let mass = grouped(mass as i64);
     if dist > reach {
@@ -2050,8 +2813,8 @@ fn kept_rate(rate: f32, mspt: f64) -> f32 {
 }
 
 /// "512 TNT: explodes in 14 s, reach 144 blocks".
-fn countdown_text(mass: usize, secs: i32) -> String {
-    let reach = shock_range(visual_size(mass as f32)).round() as i64;
+fn countdown_text(mass: u64, secs: i32) -> String {
+    let reach = shock_range(visual_size((mass as f32).min(MAX_YIELD))).round() as i64;
     format!(
         "{} TNT: explodes in {secs} s, reach {} blocks",
         grouped(mass as i64),
@@ -2639,9 +3402,10 @@ fn shock_effect(dist: f64, yield_tnt: f32, size: f32) -> Option<(f32, f64)> {
     if !(0.0..range).contains(&dist) {
         return None;
     }
-    let p = (1.0 - dist / range).powi(2);
+    let u = 1.0 - dist / range;
+    let p = u * u;
     let y = f64::from(yield_tnt.max(1.0));
-    let damage = SHOCK_DAMAGE * p as f32 * y.cbrt() as f32;
+    let damage = SHOCK_DAMAGE * (u * u * u) as f32 * y.sqrt() as f32;
     let push = (SHOCK_PUSH * p * (1.0 + 0.35 * y.ln())).min(3.9);
     Some((damage, push))
 }
@@ -2694,17 +3458,37 @@ fn shockwave(
             continue;
         }
         reached.push(id);
+        let kind = kind_of(&*host, entity);
+        // Dropped items and experience are left alone: hurt, an item is destroyed, and the drops of
+        // the very blocks the blast broke lie in its path.
+        if !feels_shockwave(kind.as_deref()) {
+            continue;
+        }
         let Some((damage, push)) = shock_effect(dist, job.yield_tnt, job.size) else {
             continue;
         };
         if damage >= 0.5 {
-            let _ = entity.hurt(host, "minecraft:explosion", damage, None, None);
+            let cooldown = entity.damage_cooldown_time(&*host);
+            entity.set_damage_cooldown_time(host, 0);
+            IN_SHOCKWAVE.with(|flag| flag.set(true));
+            let hurt = entity.hurt(host, "minecraft:explosion", damage, None, None);
+            IN_SHOCKWAVE.with(|flag| flag.set(false));
+            let hp = host.living(entity).and_then(|living| living.health(&*host));
+            destruction::debug(format_args!(
+                "shockwave {kind:?} at {dist:.1}m: dmg={damage:.1} cd={cooldown:?} hurt={hurt:?} hp={hp:?}"
+            ));
         }
-        if kind_of(&*host, entity).as_deref() != Some("minecraft:player") {
+        if kind.as_deref() != Some("minecraft:player") {
             entity.push(host, throw(c, at, push));
         }
     }
     reached
+}
+
+/// Whether an entity of kind `kind` (`minecraft:zombie`) is hurt and thrown by a shockwave: not a
+/// dropped item nor experience.
+fn feels_shockwave(kind: Option<&str>) -> bool {
+    !matches!(kind, Some("minecraft:item" | "minecraft:experience_orb"))
 }
 
 /// The default states of the blocks named `names`, in order; none if one is unknown.
@@ -3054,6 +3838,64 @@ mod tests {
         }
     }
 
+    /// A big blast of `yield_tnt` that has done all it does to the land.
+    fn finished_blast(yield_tnt: f32) -> Blast {
+        let size = visual_size(yield_tnt);
+        let radius = crater_radius(yield_tnt);
+        Blast {
+            yield_tnt,
+            size,
+            big: true,
+            carved: radius * 1.1,
+            scorched: radius * 1.7,
+            lifted: lifts_to(yield_tnt, size),
+            rimmed: radius * destruction::RIM_REACH,
+            fired: fires_to(yield_tnt, size),
+            slumped: destruction::slump_ticks(radius),
+            ..test_blast()
+        }
+    }
+
+    #[test]
+    fn the_shockwave_spares_drops_and_experience() {
+        assert!(!feels_shockwave(Some("minecraft:item")));
+        assert!(!feels_shockwave(Some("minecraft:experience_orb")));
+        for kind in [Some("minecraft:zombie"), Some("minecraft:player"), Some("minecraft:tnt"), None] {
+            assert!(feels_shockwave(kind), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_joined_explosion_breaks_its_own_blocks_unless_the_crater_takes_it_in() {
+        // Beside a blast too small to dig (two creepers), each breaks its own blocks.
+        let small = Blast { yield_tnt: 0.84, ..test_blast() };
+        assert!(!digs_over(&small, small.center));
+        // Inside a big blast's crater the crater does it; past its edge the explosion still does.
+        let big = Blast { big: true, yield_tnt: 64.0, ..test_blast() };
+        let radius = crater_radius(64.0);
+        let [x, y, z] = big.center;
+        assert!(digs_over(&big, [x + radius * 0.5, y, z]));
+        assert!(!digs_over(&big, [x + radius + 3.0, y, z]));
+    }
+
+    #[test]
+    fn the_land_is_held_until_the_blast_has_done_all_it_does() {
+        assert!(still_digging(&finished_blast(512.0)).is_none());
+        // Each part still to do keeps it held, out past where it reaches.
+        let fresh = Blast { big: true, yield_tnt: 512.0, size: visual_size(512.0), ..test_blast() };
+        let (_, reach) = still_digging(&fresh).unwrap();
+        assert!(reach >= fires_to(512.0, visual_size(512.0)));
+        assert!(reach >= lifts_to(512.0, visual_size(512.0)));
+        let slumping = Blast { slumped: 0, ..finished_blast(512.0) };
+        assert!(still_digging(&slumping).is_some());
+        let unlit = Blast { fired: 0.0, ..finished_blast(512.0) };
+        assert!(still_digging(&unlit).is_some());
+        let mut landing = finished_blast(512.0);
+        landing.impacts.push(destruction::Impact { due: 50, at: [300.5, 64.0, 0.5], radius: 2.0 });
+        let (_, reach) = still_digging(&landing).unwrap();
+        assert!(reach >= 302.0);
+    }
+
     #[test]
     fn only_plain_terrain_and_wood_flies() {
         for name in [
@@ -3166,12 +4008,12 @@ mod tests {
         }
         let look = world.look();
         let found = tnt_cluster(&look, [0, 64, 0], 1000);
-        assert_eq!(found.len(), 27);
-        assert!(found.iter().all(|p| p[0] <= 3));
-        let unique: HashSet<_> = found.iter().collect();
+        assert_eq!(found.0.len(), 27);
+        assert!(found.0.iter().all(|p| p[0] <= 3));
+        let unique: HashSet<_> = found.0.iter().collect();
         assert_eq!(unique.len(), 27);
         // A cap stops it.
-        assert_eq!(tnt_cluster(&look, [0, 64, 0], 10).len(), 10);
+        assert_eq!(tnt_cluster(&look, [0, 64, 0], 10).0.len(), 10);
         // TNT laid in a grid with a block of space between is still one mass.
         let mut grid = World(HashMap::new());
         for x in 0..5 {
@@ -3179,9 +4021,131 @@ mod tests {
                 grid.0.insert([2 + x * 2, 64, z * 2], "minecraft:tnt");
             }
         }
-        assert_eq!(tnt_cluster(&grid.look(), [0, 64, 0], 1000).len(), 25);
+        assert_eq!(tnt_cluster(&grid.look(), [0, 64, 0], 1000).0.len(), 25);
         // Nothing near: nothing taken.
-        assert!(tnt_cluster(&look, [100, 64, 100], 1000).is_empty());
+        assert!(tnt_cluster(&look, [100, 64, 100], 1000).0.is_empty());
+    }
+
+    #[test]
+    fn tnt_of_greater_worth_counts_as_much_as_it_is_worth() {
+        assert_eq!(tnt_worth("minecraft:tnt"), Some(1));
+        assert_eq!(tnt_worth("realistic_tnt:tnt_x2"), Some(2));
+        assert_eq!(tnt_worth("realistic_tnt:tnt_x1000000"), Some(1_000_000));
+        assert_eq!(tnt_worth("minecraft:stone"), None);
+        assert_eq!(tnt_worth("realistic_tnt:tnt_x3"), None);
+        // Each worth more than the one before.
+        assert!(VALUED_TNT.windows(2).all(|w| w[0].1 < w[1].1));
+        // A mass of them adds up by worth: vanilla's 1, a x10 and a x1,000 beside it.
+        let world = World(HashMap::from([
+            ([0, 64, 0], "minecraft:tnt"),
+            ([1, 64, 0], "realistic_tnt:tnt_x10"),
+            ([2, 64, 0], "realistic_tnt:tnt_x1000"),
+        ]));
+        let (cells, worth) = tnt_cluster(&world.look(), [0, 64, 0], 1000);
+        assert_eq!((cells.len(), worth), (3, 1011));
+        // Lit and gone from the world, the lit block still counts, as much as it is worth.
+        assert_eq!(mass_of(&cells, worth, [5, 64, 0], 100_000), 101_011);
+        assert_eq!(mass_of(&cells, worth, [1, 64, 0], 10), 1011);
+    }
+
+    #[test]
+    fn tracked_valued_tnt_matches_source_or_nearest_same_dimension_explosion() {
+        let entries = HashMap::from([
+            (
+                10,
+                LitWorth {
+                    worth: 1_000,
+                    pos: [10.5, 100.0, 20.5],
+                    dimension: "minecraft:overworld".into(),
+                    gone: false,
+                },
+            ),
+            (
+                11,
+                LitWorth {
+                    worth: 100,
+                    pos: [12.0, 100.0, 20.5],
+                    dimension: "minecraft:overworld".into(),
+                    gone: false,
+                },
+            ),
+            (
+                12,
+                LitWorth {
+                    worth: 10_000,
+                    pos: [10.5, 100.0, 20.5],
+                    dimension: "minecraft:the_nether".into(),
+                    gone: false,
+                },
+            ),
+        ]);
+        let mut live = HashMap::new();
+        // Exact source id always wins when tracked; an unrelated source (creeper) never steals nearby TNT.
+        assert_eq!(pick_lit_worth(&entries, Some(11), "minecraft:overworld", [0.0; 3], &live), Some(11));
+        assert_eq!(
+            pick_lit_worth(&entries, Some(999), "minecraft:overworld", [10.5, 100.06, 20.5], &live),
+            None
+        );
+        // Without source, matches nearest entry in the same dimension within LIT_MATCH_RADIUS.
+        assert_eq!(
+            pick_lit_worth(&entries, None, "minecraft:overworld", [10.5, 100.06, 20.5], &live),
+            Some(10)
+        );
+        assert_eq!(
+            pick_lit_worth(&entries, None, "minecraft:the_nether", [10.5, 100.06, 20.5], &live),
+            Some(12)
+        );
+        assert_eq!(
+            pick_lit_worth(&entries, None, "minecraft:the_end", [10.5, 100.06, 20.5], &live),
+            None
+        );
+        // Outside match radius: ignored.
+        assert_eq!(
+            pick_lit_worth(&entries, None, "minecraft:overworld", [15.0, 100.0, 20.5], &live),
+            None
+        );
+        // Live entity position overrides stale tick position, and a still-burning TNT (fuse > 1) is skipped.
+        live.insert(10, ([10.5, 98.5, 20.5], Some(0)));
+        live.insert(11, ([10.5, 100.0, 20.5], Some(40)));
+        assert_eq!(
+            pick_lit_worth(&entries, None, "minecraft:overworld", [10.5, 98.56, 20.5], &live),
+            Some(10)
+        );
+        assert_eq!(
+            pick_lit_worth(&entries, None, "minecraft:overworld", [10.5, 100.06, 20.5], &live),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn every_block_of_greater_worth_has_its_content() {
+        // tools/make_blocks.py writes one block file for each, and nothing else there.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("data/realistic_tnt/horizon/block");
+        let mut files: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| format!("realistic_tnt:{}", e.unwrap().path().file_stem().unwrap().to_string_lossy()))
+            .collect();
+        files.sort();
+        let mut known: Vec<String> = VALUED_TNT.iter().map(|(id, _)| (*id).to_owned()).collect();
+        known.sort();
+        assert_eq!(files, known);
+        for (id, _) in VALUED_TNT {
+            let name = id.strip_prefix("realistic_tnt:").unwrap();
+            let block = std::fs::read_to_string(dir.join(format!("{name}.json"))).unwrap();
+            // A plain block the mod lights itself (`ValuedTnt`), not TNT, which the game would light as one.
+            assert!(block.contains("\"minecraft:oak_planks\""), "{id} is not a plain block");
+        }
+    }
+
+    #[test]
+    fn no_pile_of_tnt_blows_up_past_the_cap() {
+        // A thousand blocks of a million TNT: the fuse, the countdown and the chunks held stay finite.
+        let mass = 1_000u64 * 1_000_000;
+        assert!(fuse_ticks(mass as f32) <= i32::from(i16::MAX));
+        assert_eq!(fuse_ticks(mass as f32), fuse_ticks(MAX_YIELD));
+        assert!(countdown_text(mass, 30).starts_with("1,000,000,000 TNT"));
+        assert!(hold_area([0, 64, 0], &[[0, 64, 0]], mass).len() <= ((2 * HOLD_CHUNKS + 1) * (2 * HOLD_CHUNKS + 1)) as usize);
+        assert!(crater_radius(MAX_YIELD) < 1000.0);
     }
 
     #[test]
@@ -3205,7 +4169,9 @@ mod tests {
             assert!(ticks >= last);
             last = ticks;
         }
-        assert_eq!(fuse_ticks(1.0e15), i32::from(i16::MAX));
+        // Past the cap on a blast's yield, no longer: about six and a half minutes.
+        assert_eq!(fuse_ticks(1.0e15), fuse_ticks(MAX_YIELD));
+        assert!(fuse_ticks(MAX_YIELD) < i32::from(i16::MAX) && fuse_ticks(MAX_YIELD) > 20 * 360);
         assert_eq!(countdown_text(512, 14), "512 TNT: explodes in 14 s, reach 144 blocks");
         assert_eq!(countdown_text(25_087, 51), "25,087 TNT: explodes in 51 s, reach 527 blocks");
         assert_eq!(
@@ -3340,7 +4306,7 @@ mod tests {
 
         // A 2 by 1 by 8 mass lit at one end, and a lone TNT inside its box but three blocks off it.
         let line: Vec<[i32; 3]> = (0..8).flat_map(|z| [[0, 64, z], [8, 64, z]]).collect();
-        let mut all = vec![new_fuse("minecraft:overworld", [0, 64, 0], &line, 300)];
+        let mut all = vec![new_fuse("minecraft:overworld", [0, 64, 0], &line, line.len() as u64, 300)];
         all[0].left = 120;
         all[0].sweep = 0;
         // Next to a block of the mass: it joins, and the mass sweeps its box again.
@@ -3357,13 +4323,13 @@ mod tests {
         // burning one holding its chunks goes last.
         let mut all = Vec::new();
         for x in 0..MAX_FUSES as i32 {
-            let mut fuse = new_fuse("minecraft:overworld", [x * 100, 64, 0], &cluster, 300);
+            let mut fuse = new_fuse("minecraft:overworld", [x * 100, 64, 0], &cluster, cluster.len() as u64, 300);
             fuse.held = true;
             all.push(fuse);
         }
         all[7].gone = Some(3);
         let (first, gone) = (all[0].id, all[7].id);
-        add_fuse(&mut all, new_fuse("minecraft:overworld", [-500, 64, 0], &cluster, 300));
+        add_fuse(&mut all, new_fuse("minecraft:overworld", [-500, 64, 0], &cluster, cluster.len() as u64, 300));
         assert_eq!(all.len(), MAX_FUSES);
         assert!(all.iter().all(|f| f.id != gone));
         assert_eq!(all[0].id, first);
@@ -3396,7 +4362,7 @@ mod tests {
             }
         }
         let cell = [1000, 85, -1000];
-        let chunks = hold_area(cell, &cube, cube.len());
+        let chunks = hold_area(cell, &cube, cube.len() as u64);
         let own = [1000 >> 4, -1000 >> 4];
         // The TNT's own chunk first, and no chunk twice.
         assert_eq!(chunks[0], [own[0] - 1, own[1] - 1]);
@@ -3412,12 +4378,18 @@ mod tests {
         assert!(!chunks.contains(&[own[0] + HOLD_CHUNKS + 1, own[1]]));
         // A disc, not a square.
         assert!(!chunks.contains(&[own[0] + 12, own[1] + 12]));
-        // A mass too small to tear up the land holds out to its crater's scorch only (27 TNT:
-        // 13.5 blocks, 1.7 times that and a margin: 3 chunks).
+        // A mass too small to tear up the land holds out to the fires it lights (27 TNT: a crater
+        // of 13.5 blocks, fires out to 2.5 times that, and a margin: 4 chunks).
         let small: Vec<[i32; 3]> = cube.iter().copied().take(27).collect();
-        let near = hold_area(cell, &small, small.len());
-        assert!(near.contains(&[own[0] + 3, own[1]]));
-        assert!(!near.contains(&[own[0] + 4, own[1]]));
+        let near = hold_area(cell, &small, small.len() as u64);
+        assert!(near.contains(&[own[0] + 4, own[1]]));
+        assert!(!near.contains(&[own[0] + 5, own[1]]));
+        // Too small to light any, out to its scorch/rim (8 TNT: a crater of 9 blocks, scorch to 1.7 times
+        // that, and a margin: 2 chunks).
+        let tiny: Vec<[i32; 3]> = cube.iter().copied().take(8).collect();
+        let tiny = hold_area(cell, &tiny, 8);
+        assert!(tiny.contains(&[own[0] + 2, own[1]]));
+        assert!(!tiny.contains(&[own[0] + 3, own[1]]));
         // However big, never past HOLD_CHUNKS out.
         let huge = hold_area(cell, &[cell], 50_000_000);
         assert!(huge.contains(&[own[0] + HOLD_CHUNKS, own[1]]));
@@ -3425,7 +4397,7 @@ mod tests {
         assert!(huge.len() <= ((2 * HOLD_CHUNKS + 1) * (2 * HOLD_CHUNKS + 1)) as usize);
         // A line of TNT longer than its crater: every chunk it runs through, and one round them.
         let line: Vec<[i32; 3]> = (0..2000).map(|x| [x * 2, 64, 0]).collect();
-        let along = hold_area([0, 64, 0], &line, line.len());
+        let along = hold_area([0, 64, 0], &line, line.len() as u64);
         assert!(along.contains(&[(3998 >> 4) + 1, 0]));
         assert!(along.contains(&[3998 >> 4, -1]));
     }
@@ -3493,6 +4465,16 @@ mod tests {
         assert!(v[0] > 0.0 && v[1] > 0.0 && v[2].abs() < 1e-9);
         let v = throw([0.0, 64.0, 0.0], [0.0, 64.0, 0.0], 100.0);
         assert!(v.iter().all(|c| c.is_finite() && c.abs() <= 3.9));
+        // 64 TNT at 5, 15, and 40 blocks: lethal near, steep falloff with distance.
+        let s64 = visual_size(64.0);
+        let (d5, _) = shock_effect(5.0, 64.0, s64).unwrap();
+        let (d15, _) = shock_effect(15.0, 64.0, s64).unwrap();
+        let (d40, _) = shock_effect(40.0, 64.0, s64).unwrap();
+        assert!(d5 > 150.0, "d5={d5}");
+        assert!(d15 > 100.0, "d15={d15}");
+        assert!(d40 > 0.0 && d40 < 35.0, "d40={d40}");
+        assert!(d5 > d15 && d15 > d40);
+        assert_eq!(shock_effect(f64::from(shock_range(s64)) + 0.1, 64.0, s64), None);
     }
 
     #[test]
@@ -3597,7 +4579,96 @@ mod tests {
         assert!(!vanilla_boom_of(BOOM_PITCH, 0.0, 4.8, 0.05));
         assert!(!vanilla_boom_of(0.7, 30.0, 4.8, 0.05));
         assert!(!vanilla_boom_of(0.7, 0.4, 4.8, 3.0));
-        assert!(boom(10.0, 4.8)[0].pitch == BOOM_PITCH);
+    }
+
+    /// The cue of `boom(dist, size)` playing `sound` (`blast.crack`), if any.
+    fn cue_of(dist: f32, size: f32, sound: &str) -> Option<Cue> {
+        boom(dist, size).into_iter().find(|c| c.sound == format!("realistic_tnt:{sound}"))
+    }
+
+    #[test]
+    fn a_blast_is_heard_as_a_real_one_is() {
+        let size = visual_size(512.0);
+        let range = shock_range(size);
+        // Close by: the roar with the flash, the ground shaking before the air wave, then the
+        // crack and the heavy boom as it arrives, the rumble after, debris, and the ears ringing.
+        let near = range * 0.3;
+        let air = sound_delay(near, size);
+        assert!(air > 0);
+        assert_eq!(cue_of(near, size, "blast.flash").unwrap().delay, 0);
+        let ground = cue_of(near, size, "blast.ground").unwrap().delay;
+        assert!(ground > 0 && ground < air, "{ground} {air}");
+        assert_eq!(cue_of(near, size, "blast.crack").unwrap().delay, air);
+        assert_eq!(cue_of(near, size, "blast.boom_large").unwrap().delay, air);
+        assert!(cue_of(near, size, "blast.boom_far").is_none());
+        assert!(cue_of(near, size, "blast.rumble").unwrap().delay > air);
+        assert!(cue_of(near, size, "blast.debris").unwrap().delay > air);
+        let ring = cue_of(near, size, "blast.ringing").unwrap();
+        assert!(ring.inside && ring.delay > air && (0.0..=1.0).contains(&ring.volume));
+        // Far off: no roar, no crack, no ringing; a dull boom and its rumble only.
+        let far = range * 5.0;
+        for sound in ["blast.flash", "blast.ground", "blast.crack", "blast.boom_large", "blast.debris", "blast.ringing"] {
+            assert!(cue_of(far, size, sound).is_none(), "{sound}");
+        }
+        assert!(cue_of(far, size, "blast.boom_far").is_some());
+        assert!(cue_of(far, size, "blast.rumble").is_some());
+        // Past where the boom carries, a positioned sound fades to nothing on its own.
+        let boom_far = cue_of(far, size, "blast.boom_far").unwrap();
+        assert!(boom_far.volume * 16.0 >= far);
+    }
+
+    #[test]
+    fn the_sound_grows_from_one_tnt_to_a_nuclear_blast() {
+        assert_eq!(SoundTier::of(1.0), (SoundTier::Small, 0.0));
+        assert_eq!(SoundTier::of(4.0).0, SoundTier::Medium);
+        assert_eq!(SoundTier::of(512.0).0, SoundTier::Large);
+        assert_eq!(SoundTier::of(200_000.0).0, SoundTier::Huge);
+        let (_, low) = SoundTier::of(100.0);
+        let (_, high) = SoundTier::of(3000.0);
+        assert!(low < high && high <= 1.0);
+        assert!((yield_of_size(visual_size(512.0)) - 512.0).abs() < 0.5);
+        // Close by each plays its own boom; one TNT has no ground rumble nor rolling tail, a
+        // nuclear-sized one its long roar, its fireball's and its wind.
+        let near = |y: f32| {
+            let size = visual_size(y);
+            boom(shock_range(size) * 0.3, size).into_iter().map(|c| c.sound).collect::<Vec<_>>()
+        };
+        let one = near(1.0);
+        assert!(one.contains(&"realistic_tnt:blast.boom_small") && one.contains(&"realistic_tnt:blast.flash_small"));
+        assert!(!one.iter().any(|s| s.ends_with("ground") || s.contains("rumble")));
+        assert!(near(27.0).contains(&"realistic_tnt:blast.boom_medium"));
+        let nuke = near(100_000.0);
+        for sound in ["boom_huge", "rumble_huge", "flash_huge", "wind", "ground", "ringing"] {
+            assert!(nuke.contains(&format!("realistic_tnt:blast.{sound}").as_str()), "{sound}");
+        }
+    }
+
+    #[test]
+    fn every_cue_is_one_the_game_takes() {
+        // The events the mod's own sounds.json defines.
+        let json = include_str!("../assets/realistic_tnt/sounds.json");
+        for (dist, size) in [(0.0, 4.0), (30.0, 4.5), (500.0, 16.0), (1.0e7, 16.0), (40.0, visual_size(200_000.0))] {
+            for cue in boom(dist, size) {
+                let event = cue.sound.strip_prefix("realistic_tnt:").unwrap();
+                assert!(json.contains(&format!("\"{event}\"")), "{event} is not in sounds.json");
+                assert!(cue.volume.is_finite() && cue.volume > 0.0);
+                // Vanilla plays pitches from 0.5 to 2 only.
+                assert!((0.5..=2.0).contains(&cue.pitch), "{cue:?}");
+                assert!((0..=1200).contains(&cue.delay), "{cue:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_world_sounds_muffled_after_a_blast_close_by_then_clears() {
+        assert!(ringing(shock_range(BASE_SIZE), BASE_SIZE).is_none());
+        let loud = ringing(0.0, BASE_SIZE).unwrap();
+        assert!(loud > ringing(5.0, BASE_SIZE).unwrap());
+        let m = Muffle { from: Instant::now(), secs: 6.0, depth: 0.7 };
+        assert!((muffled(&m, 0.0) - 0.3).abs() < 1e-6);
+        assert!(muffled(&m, 3.0) > muffled(&m, 1.0));
+        assert_eq!(muffled(&m, 6.0), 1.0);
+        assert_eq!(muffled(&m, -1.0), 1.0);
     }
 
     #[test]
@@ -3608,18 +4679,6 @@ mod tests {
         assert_eq!(sound_delay(1.0e9, BASE_SIZE), 1200);
         // A big blast's front runs faster: heard sooner from as far.
         assert!(sound_delay(200.0, visual_size(1000.0)) < sound_delay(200.0, BASE_SIZE));
-        for (dist, size) in [(0.0, 4.0), (30.0, 4.5), (500.0, 16.0), (1.0e7, 16.0)] {
-            let cues = boom(dist, size);
-            for cue in &cues {
-                // What `play_local_sound` takes: a namespaced event, and numbers in range.
-                assert!(cue.sound.starts_with("minecraft:"));
-                assert!(cue.volume.is_finite() && cue.volume > 0.0);
-                assert!(cue.pitch.is_finite() && cue.pitch > 0.0);
-                assert!((0..=1200).contains(&cue.delay), "{}", cue.delay);
-            }
-            // The thunder rolls after the boom.
-            assert!(cues[2].delay >= cues[0].delay);
-        }
     }
 
     #[test]

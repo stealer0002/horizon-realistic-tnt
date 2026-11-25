@@ -1,7 +1,7 @@
 schema = 1
 id = "realistic_tnt_shockwave"
 name = "Realistic TNT: explosions"
-version = "0.5.0"
+version = "0.6.0"
 api = "0.2"
 description = "The fireball, mushroom cloud, dust, flash and shockwave of the Realistic TNT native mod. It only draws what the mod hands it (frame.mods), so on its own it leaves the picture as vanilla."
 authors = ["Realistic TNT"]

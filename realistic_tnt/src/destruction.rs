@@ -7,10 +7,12 @@ use super::{
 };
 use mod_api::{BlockEdit, BlockRun, Heightmap, HostBlockStates, LevelRef, ServerHost};
 
-/// The rim stands about this much of the crater's radius high at its crest, and the blanket of
-/// thrown-out ground thins with the cube of the distance past it, out to `RIM_REACH` radii.
-const RIM_HEIGHT: f64 = 0.15;
-pub(super) const RIM_REACH: f64 = 1.8;
+/// Low, patchy rim of thrown-out ground: starts just outside the carved edge, fades out to
+/// `RIM_REACH` radii, and stays flat for small blasts (`radius <= RIM_MIN_RADIUS`).
+pub(super) const RIM_START: f64 = 0.98;
+pub(super) const RIM_REACH: f64 = 1.55;
+const RIM_MIN_RADIUS: f64 = 8.0;
+const RIM_MAX_PEAK: f64 = 8.0;
 /// How deep under the surface the rim looks for the ground (past tree trunks).
 const RIM_DEPTH: u32 = 24;
 /// Smaller blasts light no fires.
@@ -42,16 +44,24 @@ pub(super) fn slump_ticks(radius: f64) -> u32 {
     (60.0 + radius * 1.5).min(600.0) as u32
 }
 
-/// Raises one ring of the rim: thrown-out ground piled on the land round the crater, highest just
-/// past its edge, as a real crater's lip is.
+/// Raises one ring of the rim: thrown-out ground piled in low, broken mounds round the crater,
+/// fading smoothly out into the surrounding land.
 pub(super) fn rim(host: &mut dyn ServerHost, dimension: &str, job: &Work, from: f64, to: f64) {
     let radius = crater_radius(job.yield_tnt);
-    let peak = radius * RIM_HEIGHT;
+    if rim_peak(radius) <= 0.0 {
+        return;
+    }
     let mut piles = Vec::new();
     for [x, z] in ring_columns(job.center, from, to) {
-        let r = column_distance(job.center, x, z);
+        let dx = f64::from(x) + 0.5 - job.center[0];
+        let dz = f64::from(z) + 0.5 - job.center[2];
         let seed = mix([x, 21, z], job.id);
-        let height = (rim_height(r, radius, peak) * (0.6 + 0.8 * unit(seed, 0))).round() as u32;
+        let raw = rim_column_raw(dx, dz, radius, job.id);
+        let height = if raw < 0.10 {
+            0
+        } else {
+            raw.floor() as u32 + u32::from(unit(seed, 3) < raw.fract())
+        };
         if height > 0 {
             piles.push(((x, z), height, seed));
         }
@@ -69,11 +79,13 @@ pub(super) fn rim(host: &mut dyn ServerHost, dimension: &str, job: &Work, from: 
     if read.blocks.len() < columns.len() * depth || read.bases.len() < columns.len() {
         return;
     }
-    let standing: Vec<bool> = read
+    let palette_names: Vec<String> = read
         .palette
         .iter()
-        .map(|&state| stands_on_ground(&super::name_of(&*host, state)))
+        .map(|&state| super::name_of(&*host, state))
         .collect();
+    let standing: Vec<bool> = palette_names.iter().map(|n| stands_on_ground(n)).collect();
+    let skip_surface: Vec<bool> = palette_names.iter().map(|n| is_fluid_or_ice(n)).collect();
     let names = ["minecraft:coarse_dirt", "minecraft:dirt", "minecraft:gravel", "minecraft:cobblestone"];
     let tags = ["minecraft:air", "minecraft:logs", "minecraft:leaves", "minecraft:replaceable"];
     let (Some(palette), Some(filters)) = (states_of(&*host, &names), tag_filters(&*host, &tags)) else {
@@ -96,8 +108,28 @@ pub(super) fn rim(host: &mut dyn ServerHost, dimension: &str, job: &Work, from: 
         else {
             continue;
         };
+        if skip_surface.get(usize::from(blocks[below])).copied().unwrap_or(false) {
+            continue;
+        }
         let ground = base - depth as i32 + below as i32;
-        let fill = 1 + (unit(seed, 1) * 3.0) as u32 % 3;
+        let r_cap = unit(seed, 2);
+        let cap = if r_cap < 0.60 {
+            0
+        } else if r_cap < 0.85 {
+            1
+        } else {
+            2
+        };
+        let r_fill = unit(seed, 1);
+        let fill = if r_fill < 0.40 {
+            1
+        } else if r_fill < 0.70 {
+            0
+        } else if r_fill < 0.90 {
+            2
+        } else {
+            3
+        };
         for only in 0..tags.len() as u32 {
             if height > 1 {
                 edit.runs.push(BlockRun {
@@ -116,7 +148,7 @@ pub(super) fn rim(host: &mut dyn ServerHost, dimension: &str, job: &Work, from: 
                 y: ground + height as i32,
                 height: 1,
                 surface: None,
-                block: 0,
+                block: cap,
                 only: Some(only),
             });
         }
@@ -142,29 +174,107 @@ fn stands_on_ground(name: &str) -> bool {
         || name.ends_with("_tulip")
 }
 
-/// How high the rim stands `r` blocks out from a crater of `radius` whose crest is `peak` high.
-fn rim_height(r: f64, radius: f64, peak: f64) -> f64 {
-    let crest = radius * 1.05;
-    if r < radius * 0.95 || r > radius * RIM_REACH {
+/// Whether `name` is fluid, aquatic vegetation, or ice, over which rim ejecta should not pile.
+fn is_fluid_or_ice(name: &str) -> bool {
+    let name = name.strip_prefix("minecraft:").unwrap_or(name);
+    matches!(
+        name,
+        "water" | "lava" | "bubble_column" | "ice" | "packed_ice" | "blue_ice" | "frosted_ice"
+            | "seagrass" | "tall_seagrass" | "kelp" | "kelp_plant"
+    )
+}
+
+fn rim_peak(radius: f64) -> f64 {
+    if radius <= RIM_MIN_RADIUS {
         0.0
-    } else if r <= crest {
-        peak
     } else {
-        peak * (crest / r).powi(3)
+        ((radius - RIM_MIN_RADIUS).powf(0.56) * 0.34).min(RIM_MAX_PEAK)
     }
+}
+
+fn smoothstep(t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn value_noise_2d(x: f64, z: f64, scale: f64, salt: u64) -> f64 {
+    let sx = x / scale;
+    let sz = z / scale;
+    let ix = sx.floor() as i32;
+    let iz = sz.floor() as i32;
+    let fx = smoothstep(sx - f64::from(ix));
+    let fz = smoothstep(sz - f64::from(iz));
+    let v00 = unit(mix([ix, 0, iz], salt), 0);
+    let v10 = unit(mix([ix + 1, 0, iz], salt), 0);
+    let v01 = unit(mix([ix, 0, iz + 1], salt), 0);
+    let v11 = unit(mix([ix + 1, 0, iz + 1], salt), 0);
+    let vx0 = v00 + (v10 - v00) * fx;
+    let vx1 = v01 + (v11 - v01) * fx;
+    vx0 + (vx1 - vx0) * fz
+}
+
+fn angular_noise(theta: f64, salt: u64) -> f64 {
+    const FREQS: [(f64, f64); 4] = [(2.0, 0.35), (3.0, 0.30), (5.0, 0.22), (7.0, 0.13)];
+    let mut sum = 0.0;
+    for (i, &(freq, weight)) in FREQS.iter().enumerate() {
+        let phase = unit(salt, i as u64) * std::f64::consts::TAU;
+        sum += weight * (0.5 + 0.5 * (freq * theta + phase).sin());
+    }
+    sum.clamp(0.0, 1.0)
+}
+
+/// Radial rim envelope: rises smoothly from `inner` to `crest` and decays strictly to 0 at `outer`.
+fn rim_height(r: f64, inner: f64, crest: f64, outer: f64, peak: f64) -> f64 {
+    if peak <= 0.0 || r <= inner || r >= outer || crest <= inner || outer <= crest {
+        return 0.0;
+    }
+    if r < crest {
+        peak * smoothstep((r - inner) / (crest - inner))
+    } else {
+        peak * (1.0 - (r - crest) / (outer - crest)).powf(2.3)
+    }
+}
+
+/// Irregular, patchy rim height at horizontal offset `(dx, dz)` from the crater center.
+fn rim_column_raw(dx: f64, dz: f64, radius: f64, blast_id: u64) -> f64 {
+    let peak = rim_peak(radius);
+    if peak <= 0.0 {
+        return 0.0;
+    }
+    let r = (dx * dx + dz * dz).sqrt();
+    if r > radius * RIM_REACH {
+        return 0.0;
+    }
+    let theta = dz.atan2(dx);
+    let ang_lobe = angular_noise(theta, blast_id ^ 0xA11CE);
+    let ang_reach = angular_noise(theta, blast_id ^ 0xBEEF);
+    let broad_scale = (radius * 0.28).clamp(5.0, 22.0);
+    let detail_scale = (radius * 0.10).clamp(2.5, 8.0);
+    let broad = value_noise_2d(dx, dz, broad_scale, blast_id ^ 0x1111);
+    let detail = value_noise_2d(dx, dz, detail_scale, blast_id ^ 0x2222);
+
+    let inner = radius * (1.00 + 0.07 * detail);
+    let crest = inner + radius * (0.06 + 0.05 * broad);
+    let outer = (crest + radius * (0.14 + 0.22 * (0.6 * ang_reach + 0.4 * broad))).min(radius * RIM_REACH);
+
+    let env = rim_height(r, inner, crest, outer, peak);
+    let shape = 0.50 * ang_lobe + 0.35 * broad + 0.15 * detail;
+    let amp = ((shape - 0.26) / 0.74).clamp(0.0, 1.0);
+    env * amp * (0.85 + 0.55 * detail)
 }
 
 /// Lets a few columns of the crater's wall slide in: where the ground stands well above the ground
 /// just inside it, the top block breaks off and slides down into the crater.
 pub(super) fn slump(host: &mut dyn ServerHost, level: LevelRef, dimension: &str, job: &Work, tick: u32) {
     let radius = crater_radius(job.yield_tnt);
+    let tries = (SLUMP_TRIES + (radius / 10.0) as usize).min(24);
     let (cx, cz) = (job.center[0], job.center[2]);
-    let mut spots = Vec::with_capacity(SLUMP_TRIES);
-    let mut columns = Vec::with_capacity(SLUMP_TRIES * 2);
-    for k in 0..SLUMP_TRIES {
+    let mut spots = Vec::with_capacity(tries);
+    let mut columns = Vec::with_capacity(tries * 2);
+    for k in 0..tries {
         let seed = mix([tick as i32, k as i32, 31], job.id);
         let angle = unit(seed, 0) * std::f64::consts::TAU;
-        let r = radius * (0.75 + 0.4 * unit(seed, 1));
+        let r = radius * (0.80 + 0.32 * unit(seed, 1));
         let (dx, dz) = (angle.cos(), angle.sin());
         let at = ((cx + dx * r).floor() as i32, (cz + dz * r).floor() as i32);
         let inner = ((cx + dx * (r - 2.0)).floor() as i32, (cz + dz * (r - 2.0)).floor() as i32);
@@ -202,7 +312,14 @@ pub(super) fn slump(host: &mut dyn ServerHost, level: LevelRef, dimension: &str,
             let seed = mix([x, y, z], job.id ^ 0x51);
             let push = 0.12 + 0.15 * unit(seed, 0);
             let at = [f64::from(x) + 0.5, f64::from(y), f64::from(z) + 0.5];
-            host.spawn_falling_block(dimension, state, at, [-dx * push, 0.05, -dz * push], falling(false, true));
+            let velocity = [-dx * push, 0.05, -dz * push];
+            if !host.spawn_falling_block(dimension, state, at, velocity, falling(false, true)) {
+                // The level holds all the falling blocks it will: the block stays where it was.
+                if let Some(was) = state_of(&*host, &name) {
+                    super::set_block(host, level, [x, y, z], was);
+                }
+                break;
+            }
             slid += 1;
         }
         let at = [f64::from(x) + 0.5, f64::from(*top), f64::from(z) + 0.5];
@@ -305,16 +422,16 @@ impl Heat {
         let mut turns = Vec::new();
         for &(what, into) in HEAT {
             let filter = match what.strip_prefix('#') {
-                Some(tag) => {
-                    let id = mod_api::Identifier::parse(tag).ok()?;
-                    let key = host.tags().key(&id)?;
-                    mod_api::StatePredicate::tag(&states, host.tags(), key, &[]).ok()
-                }
+                Some(tag) => mod_api::Identifier::parse(tag)
+                    .ok()
+                    .and_then(|id| host.tags().key(&id))
+                    .and_then(|key| mod_api::StatePredicate::tag(&states, host.tags(), key, &[]).ok()),
                 None => host
                     .block_key(what)
                     .and_then(|key| mod_api::StatePredicate::block(&states, key, &[]).ok()),
             };
-            // A block this game doesn't have is skipped; so is a row whose result it doesn't have.
+            // A block or tag this game doesn't have is skipped (the rest still bakes); so is a row
+            // whose result it doesn't have.
             let (Some(filter), Some(state)) = (filter, state_of(host, into)) else {
                 continue;
             };
@@ -456,7 +573,7 @@ pub(super) fn impacts(host: &mut dyn ServerHost, level: LevelRef, dimension: &st
 }
 
 /// A line on stderr when `REALISTIC_TNT_DEBUG` is set: what the destruction did, to check it.
-fn debug(what: std::fmt::Arguments<'_>) {
+pub(super) fn debug(what: std::fmt::Arguments<'_>) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ON.get_or_init(|| std::env::var_os("REALISTIC_TNT_DEBUG").is_some()) {
         eprintln!("[realistic_tnt] {what}");
@@ -469,14 +586,54 @@ mod tests {
 
     #[test]
     fn rim_is_highest_at_the_crest_and_thins_out() {
-        let radius = 40.0;
-        let peak = radius * RIM_HEIGHT;
-        assert_eq!(rim_height(radius * 0.5, radius, peak), 0.0);
-        assert_eq!(rim_height(radius, radius, peak), peak);
-        let near = rim_height(radius * 1.2, radius, peak);
-        let far = rim_height(radius * 1.6, radius, peak);
+        let (inner, crest, outer, peak) = (40.0, 44.0, 56.0, 4.0);
+        assert_eq!(rim_height(35.0, inner, crest, outer, peak), 0.0);
+        assert_eq!(rim_height(inner, inner, crest, outer, peak), 0.0);
+        assert!(rim_height(42.0, inner, crest, outer, peak) > 0.0);
+        assert!((rim_height(crest, inner, crest, outer, peak) - peak).abs() < 1e-12);
+        let near = rim_height(48.0, inner, crest, outer, peak);
+        let far = rim_height(53.0, inner, crest, outer, peak);
         assert!(peak > near && near > far && far > 0.0);
-        assert_eq!(rim_height(radius * 2.0, radius, peak), 0.0);
+        assert_eq!(rim_height(outer, inner, crest, outer, peak), 0.0);
+        assert_eq!(rim_height(60.0, inner, crest, outer, peak), 0.0);
+    }
+
+    #[test]
+    fn rim_peak_is_flat_for_small_blasts_and_moderate_for_large() {
+        assert_eq!(rim_peak(4.5), 0.0);
+        assert_eq!(rim_peak(8.0), 0.0);
+        assert!(rim_peak(9.0) < 0.5);
+        let p64 = rim_peak(crater_radius(64.0));
+        let p4096 = rim_peak(crater_radius(4096.0));
+        assert!((0.8..2.0).contains(&p64), "p64={p64}");
+        assert!((2.5..4.5).contains(&p4096), "p4096={p4096}");
+    }
+
+    #[test]
+    fn rim_perimeter_is_patchy_with_gaps_and_bounded_by_reach() {
+        for yield_tnt in [64.0_f32, 4096.0_f32] {
+            let radius = crater_radius(yield_tnt);
+            let r_crest = radius * 1.09;
+            let mut zeros = 0;
+            let mut positives = 0;
+            let mut max_raw = 0.0_f64;
+            for i in 0..72 {
+                let theta = (i as f64 / 72.0) * std::f64::consts::TAU;
+                let raw = rim_column_raw(r_crest * theta.cos(), r_crest * theta.sin(), radius, 42);
+                if raw == 0.0 {
+                    zeros += 1;
+                } else {
+                    positives += 1;
+                    max_raw = max_raw.max(raw);
+                }
+                assert_eq!(
+                    rim_column_raw((radius * RIM_REACH + 0.5) * theta.cos(), (radius * RIM_REACH + 0.5) * theta.sin(), radius, 42),
+                    0.0
+                );
+            }
+            assert!(zeros > 0 && positives > 0, "yield={yield_tnt}: zeros={zeros}, pos={positives}");
+            assert!(max_raw <= rim_peak(radius) * 1.41, "max_raw={max_raw}");
+        }
     }
 
     #[test]
