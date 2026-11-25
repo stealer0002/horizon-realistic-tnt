@@ -19,12 +19,15 @@
 ---
 
 > [!WARNING]
-> **New installs may fail for now (not this mod's fault).** GitHub's automated anti-spam filter
+> **Horizon's GitHub is down for now (not this mod's fault).** GitHub's automated anti-spam filter
 > flagged Horizon's `horizon-rust` organisation, so its GitHub links and downloads return 404 until
-> GitHub clears the flag. It is not a takedown. While it lasts, building the mod in a new instance
-> can fail, because the launcher fetches Horizon's mod tools from there. **If you already built
-> Realistic TNT, keep playing: installed copies work normally.** This page will be updated when
-> it's back.
+> GitHub clears the flag. It is not a takedown. **If you already built Realistic TNT, keep playing:
+> installed copies work normally.**
+>
+> **New installs work through a mirror.** The Horizon team mirrors the signed mod SDK at
+> `https://horizon-mirror.nikitagrimm.de` (announced on Horizon's Discord), and it has the exact SDK
+> this mod needs (Nightly 2026-11-22, `f1bb66f`). The [install guide](#install) below shows the one
+> extra line to type first. This page will be updated when GitHub is back.
 
 A fireball and a mushroom cloud. A visible shockwave that hurts, throws and flattens what it sweeps
 over. A real crater, flying debris, and a boom you hear when the shockwave reaches you. TNT adds up:
@@ -114,10 +117,23 @@ Realistic TNT is a native mod: real code, compiled for **one exact Horizon**, Ni
 update does not break your TNT worlds. The mod gets an instance of its own, so your main game stays
 as it is.
 
-> [!NOTE]
-> While Horizon's `horizon-rust` GitHub organisation is flagged (see the warning at the top), step 3
-> can fail with a download error or a 404 on a computer that never built a Horizon mod before. Wait
-> until it's back, then run step 3 again. Nothing you did is wrong.
+> [!IMPORTANT]
+> **While Horizon's GitHub is down** (see the warning at the top), do **step 0** first, in the same
+> terminal window you use for steps 1 to 3. It points the launcher at the Horizon team's mirror of
+> the mod SDK. Once the mod is built, the SDK stays on your computer and you won't need it again.
+>
+> **Step 0 (Windows, PowerShell).** Paste this and press Enter. Nothing appears; that's normal.
+>
+> ```powershell
+> $env:HORIZON_SDK_BASE = "https://horizon-mirror.nikitagrimm.de"
+> ```
+>
+> On Linux or macOS, put `HORIZON_SDK_BASE=https://horizon-mirror.nikitagrimm.de ` in front of
+> each `horizon-launcher` command below.
+>
+> If you close the terminal before step 3, do step 0 again in the new one. If the launcher says
+> Horizon Nightly 2026-11-22 itself is missing, its download is on GitHub too: get Horizon from the
+> temporary downloads on Horizon's Discord, then come back here.
 
 **You need:**
 
@@ -202,6 +218,7 @@ still work.
 |---|---|
 | `horizon-launcher` is not found | Install the launcher from [playhorizon.dev](https://playhorizon.dev), then open a new terminal. |
 | Step 2 ended with "Build it next" | That is expected. Run step 3. |
+| Step 3 fails with a 404 or a download error | Horizon's GitHub is down. Do step 0 in the same terminal, then run step 3 again. |
 | No **Realistic TNT** tab in the game, or the game says a mod was left out | The instance was moved to another Horizon. Follow [Keep playing after Horizon updates](#keep-playing-after-horizon-updates). |
 | The build in step 3 fails because that Horizon is missing | The mod needs Horizon Nightly 2026-11-22 (`nightly-2026-11-22-f1bb66f`). Install that exact version in the launcher, then run step 3 again. |
 | The build in step 3 fails with another error | Run step 3 again. If it still fails, open an issue on this repository and attach the build log, `%APPDATA%\horizon-launcher\native\build.log` on Windows. |
