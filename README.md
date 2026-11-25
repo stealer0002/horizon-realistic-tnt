@@ -92,13 +92,14 @@ Full notes on the [v0.11.0 release](https://github.com/stealer0002/horizon-reali
   </tr>
   <tr>
     <td><a href="https://github.com/user-attachments/assets/d2015f20-e6d9-42c7-b8ef-e2eb0959690b"><img src="media/explosion.gif" alt="The original 0.8 clip: 25,087 TNT going off"></a></td>
-    <td><a href="https://youtu.be/rC_2Uwb9i0E"><img src="media/video-0.11.jpg" alt="Watch the 0.11 showcase on YouTube"></a></td>
+    <td><a href="https://github.com/user-attachments/assets/41347575-c2d8-4d19-b7b3-6256a74888e9"><img src="media/video-0.11-frame.jpg" alt="The 0.11 clip: 10,000 TNT going off"></a></td>
   </tr>
   <tr>
     <td><sub>One cube of 25,087 TNT from about 300 blocks away (15 s, with sound), shown with the
     <code>wisdom_horizon_tnt</code> shader pack.</sub></td>
-    <td><sub><b>▶ Watch on YouTube</b> (3 min): every TNT from x2 to x1,000,000, the remote detonator,
-    real explosion sounds, the condensation ring, and a walk inside the million-TNT crater.</sub></td>
+    <td><sub>One TNT x10,000, set off with the remote detonator (15 s, with sound): the fireball, the condensation
+    ring, the ground thrown up and the mushroom cloud. Every TNT from x2 to x1,000,000 in the
+    <a href="https://youtu.be/rC_2Uwb9i0E">full 3-minute showcase</a>.</sub></td>
   </tr>
 </table>
 
