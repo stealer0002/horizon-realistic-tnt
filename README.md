@@ -35,9 +35,9 @@ the more you pile, the bigger the blast, up to 10,000,000 TNT going off as one.
 
 Made for [Horizon](https://playhorizon.dev) Nightly 2026-11-22
 ([`f1bb66f`](https://github.com/horizon-rust/horizon/commit/f1bb66f353cf67f2aa4665293fc75c8d91186fc7)).
-*Made with [Claude Code](https://claude.com/claude-code) and Google [Antigravity](https://antigravity.google).*
+**▶ [Watch the 0.11 showcase](https://youtu.be/rC_2Uwb9i0E)** · *Made with [Claude Code](https://claude.com/claude-code) and Google [Antigravity](https://antigravity.google).*
 
-**Jump to:** [What's new](#whats-new-in-011) · [Gallery](#gallery) · [Install](#install) ·
+**Jump to:** [What's new](#whats-new-in-011) · [Old vs new](#old-vs-new) · [Gallery](#gallery) · [Install](#install) ·
 [TNT blocks](#tnt-blocks) · [Remote detonator](#remote-detonator) · [How it scales](#how-it-scales) ·
 [Tuning](#tuning)
 
@@ -83,14 +83,30 @@ Full notes on the [v0.11.0 release](https://github.com/stealer0002/horizon-reali
   </tr>
 </table>
 
-## The blast in the video: 25,087 TNT
+## Old vs new
 
-**The original clip (0.8)**, with sound (15 s, 1080p 60 fps): 25,087 TNT, watched from about 300
-blocks away. Shown with the `wisdom_horizon_tnt` shader pack from this repository.
+<table>
+  <tr>
+    <th width="50%">Old (0.8)</th>
+    <th width="50%">New (0.11)</th>
+  </tr>
+  <tr>
+    <td><a href="https://github.com/user-attachments/assets/d2015f20-e6d9-42c7-b8ef-e2eb0959690b"><img src="media/explosion.gif" alt="The original 0.8 clip: 25,087 TNT going off"></a></td>
+    <td><a href="https://youtu.be/rC_2Uwb9i0E"><img src="media/video-0.11.jpg" alt="Watch the 0.11 showcase on YouTube"></a></td>
+  </tr>
+  <tr>
+    <td><sub>One cube of 25,087 TNT from about 300 blocks away (15 s, with sound below), shown with the
+    <code>wisdom_horizon_tnt</code> shader pack.</sub></td>
+    <td><sub><b>▶ Watch on YouTube</b> (3 min): every TNT from x2 to x1,000,000, the remote detonator,
+    real explosion sounds, the condensation ring, and a walk inside the million-TNT crater.</sub></td>
+  </tr>
+</table>
 
-![25,087 TNT going off (the original 0.8 clip)](media/explosion.gif)
+**The old clip, with sound:**
 
 https://github.com/user-attachments/assets/d2015f20-e6d9-42c7-b8ef-e2eb0959690b
+
+### The blast in the old clip: 25,087 TNT
 
 A cube of 25,087 TNT, lit with flint and steel. The countdown over the hotbar gave **55 seconds** to fly
 away; the shockwave reached **527 blocks**.
