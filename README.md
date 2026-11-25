@@ -334,6 +334,12 @@ the explosion pack's copy is the shader API 0.2 one, which works in linear light
 - Made with [Claude Code](https://claude.com/claude-code), Anthropic's coding agent, using the
   Claude Opus 5.5 and Claude Fable 5.2 models: the mod's code, the shader pass, the test scripts, the
   diagrams and this README were written with it.
+- Also made with Google's [Antigravity](https://antigravity.google), using the Gemini 4 Neon and
+  Gemini 4 Hydrogen models: valued TNT going off at its full worth, the remote detonator, the
+  natural crater rims and the shockwave that kills what it reaches (0.10.0 and 0.11.0).
+- The blast sounds are cut from real explosions recorded in the SSE Library's *EXPLOSIONS* (USC
+  Cinema / Sunset Editorial), released under CC0 1.0 on the
+  [Internet Archive](https://archive.org/details/SSE_Library_EXPLOSIONS).
 - The mod, the explosion shader pass and the scripts: MIT ([LICENSE](LICENSE)).
 - `shader/wisdom_horizon_tnt/` is a modified copy of **Wisdom Shaders V3 (Horizon port)**: Wisdom
   Shaders by bobcao3, ported to Horizon by tomasmendes01, under the Apache License 2.0
