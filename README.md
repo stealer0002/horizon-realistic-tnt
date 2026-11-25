@@ -18,6 +18,14 @@
 
 ---
 
+> [!WARNING]
+> **New installs may fail for now (not this mod's fault).** GitHub's automated anti-spam filter
+> flagged Horizon's `horizon-rust` organisation, so its GitHub links and downloads return 404 until
+> GitHub clears the flag. It is not a takedown. While it lasts, building the mod in a new instance
+> can fail, because the launcher fetches Horizon's mod tools from there. **If you already built
+> Realistic TNT, keep playing: installed copies work normally.** This page will be updated when
+> it's back.
+
 A fireball and a mushroom cloud. A visible shockwave that hurts, throws and flattens what it sweeps
 over. A real crater, flying debris, and a boom you hear when the shockwave reaches you. TNT adds up:
 the more you pile, the bigger the blast, up to 10,000,000 TNT going off as one.
@@ -105,6 +113,11 @@ Realistic TNT is a native mod: real code, compiled for **one exact Horizon**, Ni
 (`f1bb66f`). The launcher builds it for that Horizon and keeps an instance on it, so a later Horizon
 update does not break your TNT worlds. The mod gets an instance of its own, so your main game stays
 as it is.
+
+> [!NOTE]
+> While Horizon's `horizon-rust` GitHub organisation is flagged (see the warning at the top), step 3
+> can fail with a download error or a 404 on a computer that never built a Horizon mod before. Wait
+> until it's back, then run step 3 again. Nothing you did is wrong.
 
 **You need:**
 
