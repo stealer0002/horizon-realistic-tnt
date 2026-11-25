@@ -148,27 +148,80 @@ blast does not throw the lit TNT out of its mass.
 
 ## Install
 
-Requirements:
+> Em português: [INSTALAR.md](INSTALAR.md).
 
-- Horizon's launcher 0.2.70 or newer, and a game instance it can build native mods into.
-- The mod is made with the mod SDK of Horizon nightly 2026-11-22
-  ([`f1bb66f`](https://github.com/horizon-rust/horizon/commit/f1bb66f353cf67f2aa4665293fc75c8d91186fc7),
-  `[native]` in `realistic_tnt/horizon-mod.toml`). Its `.hmod` carries the list of the API items it
-  uses (`uses.json`, written by `cargo horizon-mod build`), so the launcher also builds it on other
-  Horizon versions where none of those items changed.
+Realistic TNT is a native mod: real code, compiled for **one exact Horizon**, Nightly 2026-11-22
+([`f1bb66f`](https://github.com/horizon-rust/horizon/commit/f1bb66f353cf67f2aa4665293fc75c8d91186fc7)).
+The launcher builds it for that Horizon and keeps an instance on it, so a later Horizon update does
+not break your TNT worlds. Give the mod an instance of its own: your main game stays as it is.
 
-**1. Build the mod into your game.** Native mods are native code with full access to your computer,
-so the launcher asks you to trust them: read the source first (`realistic_tnt/src/lib.rs`).
+**You need** Horizon's launcher 0.2.70 or newer ([playhorizon.dev](https://playhorizon.dev)), signed
+in with an account that owns Minecraft: Java Edition.
+
+### 1. Make an instance for the mod
+
+In the launcher: **Instances > New instance**, name it `Realistic TNT`. Or:
 
 ```sh
-horizon-launcher native-build realistic_tnt --instance <your instance> --trust-native-code
+horizon-launcher instance create "Realistic TNT"
+```
+
+### 2. Install the mod into it
+
+In the launcher: pick the `Realistic TNT` instance, open **Mods > Add from GitHub**, paste
+
+```
+https://github.com/stealer0002/horizon-realistic-tnt/releases/tag/v0.11.0
+```
+
+and allow native code. Or:
+
+```sh
+horizon-launcher mods add-github https://github.com/stealer0002/horizon-realistic-tnt/releases/tag/v0.11.0 --instance "Realistic TNT" --trust-native-code
+```
+
+The launcher fetches Horizon Nightly 2026-11-22 if you don't have it, compiles the mod against it
+(a few minutes the first time) and makes the instance play that build. A native mod runs with your
+rights, which is why the launcher asks you to trust it: the whole source is in this repository.
+
+### 3. Play
+
+Select the instance and press **Play**. The TNT blocks and the detonator are in the creative tab
+**Realistic TNT**, or `/give @p realistic_tnt:tnt_x1000` and `/give @p realistic_tnt:detonator`.
+
+### Keep it playable after Horizon updates
+
+- The instance stays on the Horizon it was built for. A Horizon update installs beside it and
+  doesn't move it; just don't rebuild this instance with `--update` (the launcher's "update mods to
+  the newest Horizon").
+- Don't let the launcher delete the Horizon it needs:
+  ```sh
+  horizon-launcher settings prune-old-versions off
+  ```
+- **If the mod stopped working** (no Realistic TNT tab, the game says a mod was left out), the
+  instance was moved to another Horizon. Put it back on the mod's build:
+  ```sh
+  horizon-launcher versions --installed
+  horizon-launcher instance version "Realistic TNT" native-f1bb66f-XXXXXXXXXXXX
+  ```
+  (the `native-f1bb66f-…` line the first command lists), or build it again on its Horizon:
+  ```sh
+  horizon-launcher native-build --instance "Realistic TNT" --version nightly-2026-11-22-f1bb66f --trust-native-code
+  ```
+- When a version of the mod for a newer Horizon comes out, install it into a new instance the same
+  way, and keep this one until you've tried it.
+
+### From the source (developers)
+
+```sh
+horizon-launcher native-build realistic_tnt --instance <your instance> --version nightly-2026-11-22-f1bb66f --trust-native-code
 ```
 
 `realistic_tnt/` is the mod's project on its own (the folder a `.hmod` is packed from), so the shader
 packs, scripts and media live beside it. `cargo horizon-mod build` in it writes
 `target/horizon-mod/realistic_tnt.hmod`.
 
-**2. Pick the shader pack** for the fireball, the cloud, the flash and the shockwave. The mod
+**Shader pack.** Pick the shader pack for the fireball, the cloud, the flash and the shockwave. The mod
 installs its own pack: when the game starts, it writes "Realistic TNT: explosions" into the game's
 `shaderpacks/realistic_tnt_shockwave/` folder (and updates it when a newer mod carries a newer pack).
 Pick it in Options > Video Settings > Shaders; the mod never changes the pack you picked. The packed
