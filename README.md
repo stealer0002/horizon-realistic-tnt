@@ -177,7 +177,23 @@ Open a terminal: on Windows, press the Windows key, type `PowerShell` and press 
 command, paste it into the terminal (right-click or Ctrl+V), press Enter, and wait until it finishes
 before the next one. Copy each command exactly as it is, quotes included.
 
-**First, check that the launcher answers in the terminal.** Run this:
+**First, tell the terminal where the launcher is.** The launcher is the `horizon-launcher.exe` file
+you downloaded; a new terminal does not know where you saved it. On Windows:
+
+1. Right-click `horizon-launcher.exe` (hold **Shift** while you right-click if you don't see it) and
+   pick **Copy as path**.
+2. In the terminal, type `Set-Alias horizon-launcher ` (with a space at the end), paste with Ctrl+V and
+   press Enter. It looks like this, with your own path:
+
+   ```powershell
+   Set-Alias horizon-launcher "C:\Users\you\Downloads\horizon-launcher.exe"
+   ```
+
+Nothing appears; that's normal. From now on, `horizon-launcher` works in this window. If you open a
+new window, do this again. On macOS and Linux, if `horizon-launcher` is not found, type the launcher's
+full path in its place in each command below.
+
+**Then check that it answers.** Run this:
 
 ```sh
 horizon-launcher instance list
@@ -209,8 +225,10 @@ This downloads the mod from the v0.11.0 release into the instance. It does not b
 horizon-launcher mods add-github https://github.com/stealer0002/horizon-realistic-tnt/releases/tag/v0.11.0 --instance "Realistic TNT" --trust-native-code
 ```
 
-**You should see:** the mod installed, and a message that ends with **"Build it next"**.
-That is normal: go on to step 3.
+**You should see:** the mod installed (`Installed realistic_tnt 0.11.0 from GitHub`), and a message
+that ends with **"Build it next"**. Just before it, the launcher prints *"Not reviewed by the Horizon
+registry. Native mods run with full access to this computer."* That is expected: it is the warning
+that goes with `--trust-native-code`, and the source is in this repository. Go on to step 3.
 
 **In the window:** pick the `Realistic TNT` instance, open **Mods > Add from GitHub**, paste
 `https://github.com/stealer0002/horizon-realistic-tnt/releases/tag/v0.11.0` and allow native code.
@@ -224,8 +242,10 @@ instance to play that build. It takes a few minutes the first time.
 horizon-launcher native-build --instance "Realistic TNT" --trust-native-code
 ```
 
-**You should see:** the build finish, and the instance now playing a version named
-`native-f1bb66f-` followed by 12 letters and digits.
+**You should see:** `Your mods are built`, then a line like
+`native-f1bb66f-8c77f8d78b76 built and selected for its instance.` The instance now plays a version
+named `native-f1bb66f-` followed by 12 letters and digits (yours will differ). With Horizon Nightly
+2026-11-22 already installed, it took about a minute.
 
 **In the window:** do this step with the command. Even if you did steps 1 and 2 in the window, open a
 terminal and run the command above.
@@ -257,7 +277,7 @@ still work.
 
 | What you see | What to do |
 |---|---|
-| `horizon-launcher` is not found | Install the launcher from [playhorizon.dev](https://playhorizon.dev), then close the terminal and open a new one (a terminal that was already open does not see new programs). Still not found? Open an issue on this repository and say which system you use. |
+| `horizon-launcher` is not found | The terminal does not know where the launcher is. Do the `Set-Alias` line in [Install](#install) again, in the same window (it only lasts for that window). If you have not downloaded the launcher yet, get it from [playhorizon.dev](https://playhorizon.dev). Still not found? Open an issue on this repository and say which system you use. |
 | Step 2 ended with "Build it next" | That is expected. Run step 3. |
 | Step 3 fails with a 404 or a download error | Horizon's GitHub is down. Do step 0 in the same terminal, then run step 3 again. |
 | No **Realistic TNT** tab in the game, or the game says a mod was left out | The instance was moved to another Horizon. Follow [Keep playing after Horizon updates](#keep-playing-after-horizon-updates). |
