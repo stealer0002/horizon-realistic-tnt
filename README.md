@@ -18,6 +18,25 @@
 
 ---
 
+## New here? Start here
+
+**Want to play it? It takes about 5 minutes and three copy-and-paste commands.**
+
+1. Get the **Horizon launcher** from [playhorizon.dev](https://playhorizon.dev) and sign in with an
+   account that owns Minecraft: Java Edition.
+2. Follow the **[install guide](#install)**. Every step says exactly what to paste and what you
+   should see.
+3. Pick the `Realistic TNT` instance and press **Play**.
+
+**Good to know before you start:**
+
+- **Horizon is its own game and launcher** (a Rust rewrite of Minecraft Java Edition 26.3). Realistic TNT
+  only runs on Horizon. It does **not** work on regular Minecraft, Fabric, Forge or NeoForge, and it
+  is not on CurseForge or Modrinth: the download is on this page.
+- **It is not a file you drop into a folder.** The launcher builds the mod for Horizon, which is what
+  the three commands in the install guide do.
+- **Your main game stays as it is.** The mod gets an instance of its own.
+
 > [!WARNING]
 > **Horizon's GitHub is down for now (not this mod's fault).** GitHub's automated anti-spam filter
 > flagged Horizon's `horizon-rust` organisation, so its GitHub links and downloads return 404 until
@@ -37,7 +56,7 @@ Made for [Horizon](https://playhorizon.dev) Nightly 2026-11-22
 ([`f1bb66f`](https://github.com/horizon-rust/horizon/commit/f1bb66f353cf67f2aa4665293fc75c8d91186fc7)).
 **▶ [Watch the 0.11 showcase](https://youtu.be/rC_2Uwb9i0E)** · *Made with [Claude Code](https://claude.com/claude-code) and Google [Antigravity](https://antigravity.google).*
 
-**Jump to:** [What's new](#whats-new-in-011) · [Old vs new](#old-vs-new) · [Gallery](#gallery) · [Install](#install) ·
+**Jump to:** [Install](#install) · [What's new](#whats-new-in-011) · [Old vs new](#old-vs-new) · [Gallery](#gallery) ·
 [TNT blocks](#tnt-blocks) · [Remote detonator](#remote-detonator) · [How it scales](#how-it-scales) ·
 [Tuning](#tuning)
 
@@ -158,6 +177,15 @@ Open a terminal: on Windows, press the Windows key, type `PowerShell` and press 
 command, paste it into the terminal (right-click or Ctrl+V), press Enter, and wait until it finishes
 before the next one. Copy each command exactly as it is, quotes included.
 
+**First, check that the launcher answers in the terminal.** Run this:
+
+```sh
+horizon-launcher instance list
+```
+
+**You should see:** a list of your instances, or an empty list. Either way, you are ready for step 1.
+If it says the command is not found, see the first row of [If something goes wrong](#if-something-goes-wrong).
+
 If you prefer the launcher window, steps 1 and 2 can also be done there (written under each
 command). Step 3, the build, is done with the command.
 
@@ -229,7 +257,7 @@ still work.
 
 | What you see | What to do |
 |---|---|
-| `horizon-launcher` is not found | Install the launcher from [playhorizon.dev](https://playhorizon.dev), then open a new terminal. |
+| `horizon-launcher` is not found | Install the launcher from [playhorizon.dev](https://playhorizon.dev), then close the terminal and open a new one (a terminal that was already open does not see new programs). Still not found? Open an issue on this repository and say which system you use. |
 | Step 2 ended with "Build it next" | That is expected. Run step 3. |
 | Step 3 fails with a 404 or a download error | Horizon's GitHub is down. Do step 0 in the same terminal, then run step 3 again. |
 | No **Realistic TNT** tab in the game, or the game says a mod was left out | The instance was moved to another Horizon. Follow [Keep playing after Horizon updates](#keep-playing-after-horizon-updates). |
