@@ -27,6 +27,10 @@
 2. Follow the **[install guide](#install)**. Every step says exactly what to paste and what you
    should see.
 3. Pick the `Realistic TNT` instance and press **Play**.
+4. **Switch on the shader pack, once, before you light anything.** It is installed for you but starts
+   switched off. In the game: **Options > Video Settings > Shaders > Shader Packs...**, then click
+   **Realistic TNT: explosions** until it says **On** ([step 5](#step-5-turn-on-the-shader-pack)).
+   Without it you get the crater and the debris, but no fireball, mushroom cloud or shockwave.
 
 **Good to know before you start:**
 
@@ -262,14 +266,25 @@ Select the `Realistic TNT` instance and press **Play**.
 - With cheats on (or as an operator), type in chat: `/give @p realistic_tnt:tnt_x1000` and
   `/give @p realistic_tnt:detonator`.
 
+Before you light your first TNT, do step 5. It takes ten seconds, and the fireball and the mushroom
+cloud only show up once it is done.
+
 ### Step 5. Turn on the shader pack
 
 The fireball, the mushroom cloud, the flash, the shockwave and the condensation ring are drawn by a
-shader pack. The mod installs its own pack when the game starts from the `Realistic TNT` instance.
-Once the game is open (step 4), go to **Options > Video Settings > Shaders** and pick
-**Realistic TNT: explosions**. If it is not in the list, quit the game and start it again.
+shader pack. The mod puts its pack in your instance when the game starts, and the pack starts
+**switched off**. You turn it on once:
 
-The mod never changes the pack you picked. Without a shader pack, the craters, debris, damage,
+1. In the game, open **Options > Video Settings** and go to the **Shaders** tab.
+2. Press **Shader Packs...**
+3. Click **Realistic TNT: explosions** until the line reads **Realistic TNT: explosions: On**.
+
+**You should see:** the line ends in `On`, and the hint under it says the pack is in use. Light a TNT
+and the blast has a fireball, a mushroom cloud and a ring of dust. The game remembers the choice, so
+you do not have to do this again. If **Realistic TNT: explosions** is not in the list, quit the game
+and start it again from the `Realistic TNT` instance.
+
+The mod never changes the pack you picked. Without the shader pack, the craters, debris, damage,
 sounds and everything else marked "no" in [What every explosion does](#what-every-explosion-does)
 still work.
 
@@ -277,13 +292,13 @@ still work.
 
 | What you see | What to do |
 |---|---|
+| The blast has no fireball, no mushroom cloud and no shockwave, only a crater, fire and flying debris | The shader pack is still off (it starts that way). Do [step 5](#step-5-turn-on-the-shader-pack): **Options > Video Settings > Shaders > Shader Packs...**, then click **Realistic TNT: explosions** until it says **On**. |
 | `horizon-launcher` is not found | The terminal does not know where the launcher is. Do the `Set-Alias` line in [Install](#install) again, in the same window (it only lasts for that window). If you have not downloaded the launcher yet, get it from [playhorizon.dev](https://playhorizon.dev). Still not found? Open an issue on this repository and say which system you use. |
 | Step 2 ended with "Build it next" | That is expected. Run step 3. |
 | Step 3 fails with a 404 or a download error | Horizon's GitHub is down. Do step 0 in the same terminal, then run step 3 again. |
 | No **Realistic TNT** tab in the game, or the game says a mod was left out | The instance was moved to another Horizon. Follow [Keep playing after Horizon updates](#keep-playing-after-horizon-updates). |
 | The build in step 3 fails because that Horizon is missing | The mod needs Horizon Nightly 2026-11-22 (`nightly-2026-11-22-f1bb66f`). Install that exact version in the launcher, then run step 3 again. |
 | The build in step 3 fails with another error | Run step 3 again. If it still fails, open an issue on this repository and attach the build log, `%APPDATA%\horizon-launcher\native\build.log` on Windows. |
-| No fireball or mushroom cloud, only smoke and craters | The shader pack is off. Do step 5. |
 | The flash hurts your eyes | Set the pack's **Explosion flash** option to 0. |
 
 ### Keep playing after Horizon updates
